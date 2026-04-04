@@ -31,13 +31,34 @@ from PySide6.QtGui import (
     QFont, QColor, QPalette, QIcon, QPixmap, QPainter, QBrush,
     QLinearGradient, QFontDatabase, QPen, QClipboard, QAction
 )
+from PySide6.QtWidgets import QButtonGroup, QRadioButton
+
+# GPU mining support (optional — wallet works fine without pyopencl)
+try:
+    from gpu_miner import GpuMiner, detect_gpu
+    _GPU_NAME = detect_gpu()          # None if no GPU / no pyopencl
+    GPU_AVAILABLE = _GPU_NAME is not None
+except ImportError:
+    GpuMiner      = None
+    GPU_AVAILABLE = False
+    _GPU_NAME     = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 SERVER_URL = "http://cloudy.freemyip.com:8765"
 BLOCK_REWARD = 1
-MINING_CHECK_INTERVAL = 500_000   # nonces between chain-tip checks
+MINING_CHECK_INTERVAL = 500_000   # nonces between chain-tip checks (CPU)
+
+# Speed presets ───────────────────────────────────────────────────────────────
+# CPU: sleep injected per nonce in the inner Python loop
+CPU_SLEEP_NORMAL = 0.0001    # 100 µs/nonce  → frees ≈50 % CPU headroom
+CPU_SLEEP_HIGH   = 0.0       # no sleep      → max hashrate
+
+# GPU: sleep between 1 M-nonce batches  (uses stop-flag wait, so it's responsive)
+GPU_SLEEP_NORMAL = 0.08      # 80 ms rest between batches → GPU ~< 50 % load
+GPU_SLEEP_HIGH   = 0.0       # no rest       → max hashrate
+GPU_BATCH_SIZE   = 1_000_000 # nonces per GPU dispatch
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  COLOUR PALETTE  (dark industrial / terminal aesthetic)
@@ -73,7 +94,7 @@ QWidget {{
 }}
 
 /* ── Tab widget ──────────────────────────────────────────────────── */
-QTabWidget::pane {{
+QTabWidget::pane {{2
     border: 1px solid {C["border"]};
     background: {C["bg2"]};
     border-radius: 8px;
@@ -361,6 +382,44 @@ def truncate(s: str, head: int = 8, tail: int = 8) -> str:
         return s
     return f"{s[:head]}…{s[-tail:]}"
 
+# Maximum possible SHA-256 target (all bits set = easiest mining)
+#_MAX_TARGET = (1 << 256) - 1
+MAX_256 = 2**256  # Total number of possible SHA-256 hashes
+
+def format_difficulty(target) -> str:
+    """
+    Convert a raw difficulty target integer to the expected average
+    number of hash attempts required to find a valid solution.
+    """
+    try:
+        tgt = int(target)
+    except (TypeError, ValueError):
+        return "?"
+
+    if tgt < 0:
+        # Re-interpret negative 256-bit overflow as unsigned
+        tgt = tgt & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+
+    # If the target is zero, it's mathematically impossible to find a block.
+    # Attempts approach infinity.
+    if tgt == 0:
+        return "∞"
+
+    # Purely probabilistic average attempts: 2^256 / target
+    attempts = MAX_256 / tgt
+
+    # Format the float into a clean k, M, G string
+    if attempts >= 1_000_000_000_000:
+        return f"{attempts/1_000_000_000_000:.2f}T"
+    if attempts >= 1_000_000_000:
+        return f"{attempts/1_000_000_000:.2f}G"
+    if attempts >= 1_000_000:
+        return f"{attempts/1_000_000:.2f}M"
+    if attempts >= 1_000:
+        return f"{attempts/1_000:.2f}k"
+
+    return f"{attempts:.2f}"
+
 def api_get(path: str, timeout: int = 5):
     return requests.get(f"{SERVER_URL}{path}", timeout=timeout).json()
 
@@ -398,12 +457,13 @@ class MiningWorker(QThread):
     stats_signal    = Signal(dict)      # {"hashrate": float, "nonce": int, "block": int}
     found_signal    = Signal(int, str)  # (block_index, block_hash)
 
-    def __init__(self, address: str):
+    def __init__(self, address: str, throttle_sleep: float = 0.0):
         super().__init__()
-        self._address = address
-        self._stop_flag = threading.Event()
-        self._blocks_found = 0
-        self._total_hashes = 0
+        self._address        = address
+        self._throttle_sleep = throttle_sleep   # seconds to sleep per nonce (0 = full speed)
+        self._stop_flag      = threading.Event()
+        self._blocks_found   = 0
+        self._total_hashes   = 0
 
     def stop(self):
         self._stop_flag.set()
@@ -502,8 +562,22 @@ class MiningWorker(QThread):
                     break
 
                 nonce += 1
+                if self._throttle_sleep > 0:
+                    time.sleep(self._throttle_sleep)
 
         self.log_signal.emit("■  Mining stopped.")
+
+
+class HealthCheckWorker(QThread):
+    """Non-blocking server ping — emits True if node is reachable."""
+    result_signal = Signal(bool)
+
+    def run(self):
+        try:
+            r = requests.get(f"{SERVER_URL}/utxos", timeout=3)
+            self.result_signal.emit(r.status_code == 200)
+        except Exception:
+            self.result_signal.emit(False)
 
 
 class BalanceWorker(QThread):
@@ -529,6 +603,46 @@ class BalanceWorker(QThread):
             self.error_signal.emit(str(e))
 
 
+class GpuMiningWorker(QThread):
+    """
+    Wraps GpuMiner (PyOpenCL) in a QThread and bridges its callbacks
+    to Qt signals so the UI can consume them safely.
+    """
+    log_signal   = Signal(str)
+    stats_signal = Signal(dict)      # {"hashrate", "nonce", "block", "blocks_found", "eta"}
+    found_signal = Signal(int, str)  # (block_index, block_hash)
+
+    def __init__(self, address: str, inter_batch_sleep: float = 0.0):
+        super().__init__()
+        self._address           = address
+        self._inter_batch_sleep = inter_batch_sleep
+        self._miner             = None
+
+    def stop(self):
+        if self._miner is not None:
+            self._miner.stop()
+
+    def run(self):
+        if GpuMiner is None:
+            self.log_signal.emit("✗ gpu_miner.py not found — place it next to wallet.py")
+            return
+        if not GPU_AVAILABLE:
+            self.log_signal.emit("✗ No OpenCL GPU detected — check drivers / pyopencl install")
+            return
+
+        self._miner = GpuMiner(
+            address           = self._address,
+            server_url        = SERVER_URL,
+            batch_size        = GPU_BATCH_SIZE,
+            inter_batch_sleep = self._inter_batch_sleep,
+            on_log            = self.log_signal.emit,
+            on_stats          = self.stats_signal.emit,
+            on_found          = self.found_signal.emit,
+        )
+        self._miner.run()
+        self.log_signal.emit("■  GPU mining stopped.")
+
+
 class ExplorerWorker(QThread):
     """Fetches blockchain data for the explorer tab."""
     result_signal = Signal(dict)
@@ -538,11 +652,81 @@ class ExplorerWorker(QThread):
         try:
             chain_data  = api_get("/blockchain")
             utxos       = api_get("/utxos")
+
+            # 1. Create a safe copy of the chain data to prevent C++ overflows
+            safe_chain = []
+            for block in chain_data.get("chain", []):
+                # Make a shallow copy of the block dictionary
+                block_copy = block.copy()
+
+                # Check if the difficulty target exists and is an integer
+                tgt = block_copy.get("difficulty_target")
+                if isinstance(tgt, int):
+                    # Convert it to a string! C++ handles strings of any length flawlessly.
+                    block_copy["difficulty_target"] = str(tgt)
+
+                safe_chain.append(block_copy)
+
+            # 2. Emit the signal with the safe chain data
             self.result_signal.emit({
-                "chain":   chain_data["chain"],
-                "mempool": chain_data["mempool"],
+                "chain":   safe_chain,
+                "mempool": chain_data.get("mempool", []),
                 "utxos":   utxos,
             })
+
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+class LeaderboardWorker(QThread):
+    """
+    Scans the full chain + UTXO set to build two ranked lists:
+      • miners_ranked  — addresses sorted by number of blocks mined (coinbase count)
+      • balances_ranked — addresses sorted by total UTXO balance (descending)
+    This can be slow on long chains, so it only runs on-demand when the
+    Leaderboard tab is opened.
+    """
+    result_signal = Signal(list, list)   # (miners_ranked, balances_ranked)
+    error_signal  = Signal(str)
+
+    def run(self):
+        try:
+            chain_data = api_get("/blockchain", timeout=20)
+            utxos      = api_get("/utxos",      timeout=10)
+
+            # ── Blocks mined: count coinbase outputs per address ──────
+            blocks_mined: dict[str, int] = {}
+            for block in chain_data.get("chain", []):
+                if block.get("index", 0) == 0:
+                    continue   # skip genesis block
+                for tx in block.get("transactions", []):
+                    if str(tx.get("tx_id", "")).startswith("coinbase_"):
+                        for out in tx.get("outputs", []):
+                            addr = out.get("address", "")
+                            if addr:
+                                blocks_mined[addr] = blocks_mined.get(addr, 0) + 1
+
+            miners_ranked = sorted(
+                [{"address": a, "blocks": b} for a, b in blocks_mined.items()],
+                key=lambda x: x["blocks"],
+                reverse=True,
+            )
+
+            # ── Balance: sum all UTXOs per address ────────────────────
+            balances: dict[str, float] = {}
+            for _key, out in utxos.items():
+                addr = out.get("address", "")
+                if addr:
+                    balances[addr] = balances.get(addr, 0.0) + out.get("amount", 0.0)
+
+            balances_ranked = sorted(
+                [{"address": a, "balance": b} for a, b in balances.items()],
+                key=lambda x: x["balance"],
+                reverse=True,
+            )
+
+            self.result_signal.emit(miners_ranked, balances_ranked)
+
         except Exception as e:
             self.error_signal.emit(str(e))
 
@@ -1115,33 +1299,96 @@ class MiningTab(QWidget):
 
         # ── Config area ──────────────────────────────────────────────
         cfg = QGroupBox("Configuration")
-        cfg_lay = QHBoxLayout(cfg)
-        cfg_lay.setSpacing(12)
+        cfg_lay = QVBoxLayout(cfg)
+        cfg_lay.setSpacing(10)
 
-        cfg_lay.addWidget(QLabel("Reward address:"))
+        # Address row
+        addr_row = QHBoxLayout()
+        addr_row.addWidget(QLabel("Reward address:"))
         self._addr_input = QLineEdit()
         self._addr_input.setPlaceholderText("Auto-filled from wallet, or paste manually…")
         if self.wallet.loaded:
             self._addr_input.setText(self.wallet.address)
-        cfg_lay.addWidget(self._addr_input, 1)
+        addr_row.addWidget(self._addr_input, 1)
 
         self._start_btn = QPushButton("⛏  Start Mining")
         self._start_btn.setObjectName("primary")
         self._start_btn.setMinimumWidth(140)
         self._start_btn.clicked.connect(self._toggle_mining)
-        cfg_lay.addWidget(self._start_btn)
+        addr_row.addWidget(self._start_btn)
+        cfg_lay.addLayout(addr_row)
+
+        cfg_lay.addWidget(divider())
+
+        # Mode + Speed row
+        options_row = QHBoxLayout()
+        options_row.setSpacing(24)
+
+        # — Miner mode —
+        mode_lbl = QLabel("Miner:")
+        mode_lbl.setStyleSheet(f"color:{C['text3']}; font-size:11px; font-weight:600;")
+        options_row.addWidget(mode_lbl)
+
+        self._mode_group = QButtonGroup(self)
+        self._rb_cpu = QRadioButton("CPU")
+        self._rb_cpu.setChecked(True)
+
+        # GPU radio — disabled if no GPU detected
+        gpu_label = "GPU"
+        if GPU_AVAILABLE and _GPU_NAME:
+            short_name = _GPU_NAME[:30] + ("…" if len(_GPU_NAME) > 30 else "")
+            gpu_label  = f"GPU  ({short_name})"
+        self._rb_gpu = QRadioButton(gpu_label)
+        self._rb_gpu.setEnabled(GPU_AVAILABLE)
+        if not GPU_AVAILABLE:
+            tip = "No OpenCL GPU detected" if GpuMiner is not None else "gpu_miner.py not found"
+            self._rb_gpu.setToolTip(tip)
+
+        self._mode_group.addButton(self._rb_cpu, 0)
+        self._mode_group.addButton(self._rb_gpu, 1)
+        options_row.addWidget(self._rb_cpu)
+        options_row.addWidget(self._rb_gpu)
+
+        options_row.addSpacing(32)
+
+        # — Speed —
+        spd_lbl = QLabel("Speed:")
+        spd_lbl.setStyleSheet(f"color:{C['text3']}; font-size:11px; font-weight:600;")
+        options_row.addWidget(spd_lbl)
+
+        self._speed_group = QButtonGroup(self)
+        self._rb_normal = QRadioButton("Normal")
+        self._rb_normal.setChecked(True)
+        self._rb_normal.setToolTip(
+            "CPU: 100 µs sleep/nonce — keeps PC responsive\n"
+            "GPU: 80 ms rest between batches — GPU stays cool"
+        )
+        self._rb_high = QRadioButton("High Speed")
+        self._rb_high.setToolTip(
+            "CPU: no sleep — max hashrate, high CPU usage\n"
+            "GPU: continuous batches — max hashrate"
+        )
+        self._speed_group.addButton(self._rb_normal, 0)
+        self._speed_group.addButton(self._rb_high,   1)
+        options_row.addWidget(self._rb_normal)
+        options_row.addWidget(self._rb_high)
+
+        options_row.addStretch()
+        cfg_lay.addLayout(options_row)
         root.addWidget(cfg)
 
         # ── Stat cards ───────────────────────────────────────────────
         stats_row = QHBoxLayout()
         stats_row.setSpacing(12)
 
-        self._hr_card     = StatCard("HASHRATE",      "—  H/s",  C["accent"])
-        self._nonce_card  = StatCard("NONCES TRIED",  "0",        C["accent2"])
-        self._block_card  = StatCard("CURRENT BLOCK", "—",        C["text"])
-        self._found_card  = StatCard("BLOCKS FOUND",  "0",        C["accent4"])
+        self._hr_card     = StatCard("HASHRATE",      "—",  C["accent"])
+        self._nonce_card  = StatCard("NONCES TRIED",  "0",  C["accent2"])
+        self._block_card  = StatCard("CURRENT BLOCK", "—",  C["text"])
+        self._found_card  = StatCard("BLOCKS FOUND",  "0",  C["accent4"])
+        self._eta_card    = StatCard("ETA",            "—",  C["text2"])
 
-        for c in (self._hr_card, self._nonce_card, self._block_card, self._found_card):
+        for c in (self._hr_card, self._nonce_card, self._block_card,
+                  self._found_card, self._eta_card):
             stats_row.addWidget(c)
         root.addLayout(stats_row)
 
@@ -1189,11 +1436,25 @@ class MiningTab(QWidget):
         if not addr:
             QMessageBox.warning(self, "No Address", "Enter a reward address first.")
             return
-        self._worker = MiningWorker(addr)
+
+        high_speed = self._speed_group.checkedId() == 1   # 1 = High Speed
+        use_gpu    = self._mode_group.checkedId()  == 1   # 1 = GPU
+
+        if use_gpu:
+            sleep = GPU_SLEEP_HIGH if high_speed else GPU_SLEEP_NORMAL
+            self._worker = GpuMiningWorker(addr, inter_batch_sleep=sleep)
+            mode_tag = f"GPU  {'[HIGH SPEED]' if high_speed else '[NORMAL]'}"
+        else:
+            sleep = CPU_SLEEP_HIGH if high_speed else CPU_SLEEP_NORMAL
+            self._worker = MiningWorker(addr, throttle_sleep=sleep)
+            mode_tag = f"CPU  {'[HIGH SPEED]' if high_speed else '[NORMAL — throttled]'}"
+
         self._worker.log_signal.connect(self._append_log)
         self._worker.stats_signal.connect(self._update_stats)
         self._worker.found_signal.connect(self._on_found)
         self._worker.start()
+
+        self._append_log(f"  Mode: {mode_tag}")
 
         self._start_btn.setText("■  Stop Mining")
         self._start_btn.setObjectName("danger")
@@ -1202,6 +1463,10 @@ class MiningTab(QWidget):
         self._state_lbl.setText("Mining…")
         self._state_lbl.setStyleSheet(f"color:{C['accent']}; font-size:11px;")
         self._prog.setVisible(True)
+
+        # Lock mode/speed while running
+        for w in (self._rb_cpu, self._rb_gpu, self._rb_normal, self._rb_high):
+            w.setEnabled(False)
 
     def _stop_mining(self):
         if self._worker:
@@ -1213,6 +1478,12 @@ class MiningTab(QWidget):
         self._state_lbl.setText("Idle")
         self._state_lbl.setStyleSheet(f"color:{C['text3']}; font-size:11px;")
         self._prog.setVisible(False)
+
+        # Restore mode/speed controls (GPU only if actually available)
+        self._rb_cpu.setEnabled(True)
+        self._rb_normal.setEnabled(True)
+        self._rb_high.setEnabled(True)
+        self._rb_gpu.setEnabled(GPU_AVAILABLE)
 
     # ── Worker callbacks ─────────────────────────────────────────────
     def _append_log(self, msg: str):
@@ -1228,7 +1499,9 @@ class MiningTab(QWidget):
 
     def _update_stats(self, stats: dict):
         hr = stats.get("hashrate", 0)
-        if hr >= 1_000_000:
+        if hr >= 1_000_000_000:
+            hr_str = f"{hr/1_000_000_000:.2f} GH/s"
+        elif hr >= 1_000_000:
             hr_str = f"{hr/1_000_000:.2f} MH/s"
         elif hr >= 1_000:
             hr_str = f"{hr/1_000:.2f} kH/s"
@@ -1239,6 +1512,7 @@ class MiningTab(QWidget):
         self._nonce_card.update_value(f"{stats.get('nonce', 0):,}")
         self._block_card.update_value(str(stats.get("block", "—")))
         self._found_card.update_value(str(stats.get("blocks_found", 0)))
+        self._eta_card.update_value(stats.get("eta", "—"))
 
     def _on_found(self, index: int, bh: str):
         ca = C["accent4"]
@@ -1334,10 +1608,7 @@ class ExplorerTab(QWidget):
 
         self._block_list.itemClicked.connect(self._show_block_detail)
 
-        # Auto-refresh every 30 s
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.refresh)
-        self._timer.start(30_000)
+        # No auto-refresh — triggered by tab switch in MainWindow
 
     def refresh(self):
         self._last_update.setText("Refreshing…")
@@ -1357,11 +1628,10 @@ class ExplorerTab(QWidget):
         self._mempool_card.update_value(str(len(mempool)))
         self._utxo_card.update_value(str(len(utxos)))
 
-        # Difficulty (bits)
+        # Difficulty — Bitcoin-style: difficulty = max_target / current_target
         if chain:
             tgt = chain[-1].get("difficulty_target", 0)
-            diff_bits = tgt.bit_length()
-            self._diff_card.update_value(f"{diff_bits} bit")
+            self._diff_card.update_value(format_difficulty(tgt))
 
         # Recent blocks (newest first)
         self._block_list.clear()
@@ -1395,14 +1665,176 @@ class ExplorerTab(QWidget):
         self._last_update.setStyleSheet(f"color:{C['error']}; font-size:10px;")
 
     def _show_block_detail(self, item: QListWidgetItem):
-        idx = item.data(Qt.UserRole)
-        if idx is None or not hasattr(self, "_chain_data"):
+            idx = item.data(Qt.UserRole)
+            if idx is None or not hasattr(self, "_chain_data"):
+                return
+            blk = next((b for b in self._chain_data if b["index"] == idx), None)
+            if not blk:
+                return
+
+            # 1. Create a copy so we don't accidentally ruin the real background data
+            blk_display = blk.copy()
+
+            # 2. Grab the target and check if it was mangled into a negative number
+            tgt = blk_display.get("difficulty_target")
+            if isinstance(tgt, int) and tgt < 0:
+                # Reconstruct the massive unsigned 256-bit integer from the overflow
+                blk_display["difficulty_target"] = tgt & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+
+            # 3. Dump to text using the pure-Python encoder fallback
+            pretty = json.dumps(blk_display, indent=2, check_circular=False, ensure_ascii=False)
+            self._detail.setPlainText(pretty)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LEADERBOARD TAB
+# ─────────────────────────────────────────────────────────────────────────────
+_RANK_ICONS = ["🥇", "🥈", "🥉"]
+_RANK_COLORS = [C["accent4"], C["text"], C["accent2"]]   # gold / white / cyan
+
+def _make_rank_item(rank: int, addr: str, value_str: str) -> QListWidgetItem:
+    """Build a ranked list row with medal or numeric rank."""
+    prefix = _RANK_ICONS[rank] if rank < 3 else f" #{rank + 1:>3}"
+    item   = QListWidgetItem(f"  {prefix}   {addr}   {value_str}")
+    if rank < 3:
+        item.setForeground(QColor(_RANK_COLORS[rank]))
+    return item
+
+
+class LeaderboardTab(QWidget):
+    """
+    Shows two side-by-side leaderboards:
+      Left  — Most Blocks Mined  (miner addresses ranked by coinbase count)
+      Right — Highest Balance    (addresses ranked by total UTXO balance)
+
+    Data is fetched lazily — only when this tab is first opened or manually
+    refreshed — because scanning the whole chain is resource-intensive.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._worker: LeaderboardWorker | None = None
+        self._build()
+
+    # ── UI construction ───────────────────────────────────────────────
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(16)
+
+        # Header row ─────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        title = QLabel("LEADERBOARD")
+        title.setObjectName("heading")
+        hdr.addWidget(title)
+        hdr.addStretch()
+
+        self._ts_lbl = QLabel("Not yet loaded — open this tab to refresh")
+        self._ts_lbl.setStyleSheet(f"color:{C['text3']}; font-size:11px;")
+        hdr.addWidget(self._ts_lbl)
+
+        refresh_btn = QPushButton("↻ Refresh")
+        refresh_btn.setObjectName("ghost")
+        refresh_btn.clicked.connect(self.refresh)
+        hdr.addWidget(refresh_btn)
+        root.addLayout(hdr)
+        root.addWidget(divider())
+
+        # Note about lazy loading ─────────────────────────────────────
+        note = QLabel(
+            "⚡ Data loads on first visit and on manual refresh — "
+            "scanning the full chain is skipped while you're on other tabs."
+        )
+        note.setStyleSheet(f"color:{C['text3']}; font-size:10px;")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        # Two-column leaderboard panels ───────────────────────────────
+        cols = QHBoxLayout()
+        cols.setSpacing(16)
+
+        # Left — Blocks Mined
+        miners_group = QGroupBox("⛏  Most Blocks Mined")
+        miners_lay   = QVBoxLayout(miners_group)
+        self._miners_list = QListWidget()
+        self._miners_list.setSelectionMode(QListWidget.NoSelection)
+        miners_lay.addWidget(self._miners_list)
+        cols.addWidget(miners_group)
+
+        # Right — Highest Balance
+        bal_group  = QGroupBox("◎  Highest Balance")
+        bal_lay    = QVBoxLayout(bal_group)
+        self._bal_list = QListWidget()
+        self._bal_list.setSelectionMode(QListWidget.NoSelection)
+        bal_lay.addWidget(self._bal_list)
+        cols.addWidget(bal_group)
+
+        root.addLayout(cols, 1)
+
+        # Status bar at the bottom ────────────────────────────────────
+        self._status_lbl = QLabel("")
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        self._status_lbl.setStyleSheet(f"color:{C['text2']}; font-size:11px;")
+        root.addWidget(self._status_lbl)
+
+    # ── Public slot — called by MainWindow._on_tab_changed ────────────
+    def refresh(self):
+        """Kick off a background fetch; silently skip if one is already running."""
+        if self._worker and self._worker.isRunning():
             return
-        blk = next((b for b in self._chain_data if b["index"] == idx), None)
-        if not blk:
-            return
-        pretty = json.dumps(blk, indent=2, ensure_ascii=False)
-        self._detail.setPlainText(pretty)
+
+        self._status_lbl.setText("⏳  Scanning blockchain and UTXO set…")
+        self._ts_lbl.setText("Updating…")
+
+        for lst in (self._miners_list, self._bal_list):
+            lst.clear()
+            lst.addItem(QListWidgetItem("  Loading…"))
+
+        self._worker = LeaderboardWorker()
+        self._worker.result_signal.connect(self._on_result)
+        self._worker.error_signal.connect(self._on_error)
+        self._worker.start()
+
+    # ── Result handlers ───────────────────────────────────────────────
+    def _on_result(self, miners: list, balances: list):
+        import time as _time
+        self._ts_lbl.setText(f"Last updated  {_time.strftime('%H:%M:%S')}")
+        self._status_lbl.setText(
+            f"✓  {len(miners)} miner address{'es' if len(miners) != 1 else ''}  ·  "
+            f"{len(balances)} balance{'s' if len(balances) != 1 else ''} found"
+        )
+        self._status_lbl.setStyleSheet(f"color:{C['success']}; font-size:11px;")
+
+        # Populate miners list
+        self._miners_list.clear()
+        if miners:
+            for i, entry in enumerate(miners[:100]):
+                blocks = entry["blocks"]
+                value_str = f"{blocks} block{'s' if blocks != 1 else ''}"
+                self._miners_list.addItem(
+                    _make_rank_item(i, truncate(entry["address"], 10, 10), value_str)
+                )
+        else:
+            self._miners_list.addItem(QListWidgetItem("  No mined blocks found"))
+
+        # Populate balance list
+        self._bal_list.clear()
+        if balances:
+            for i, entry in enumerate(balances[:100]):
+                value_str = f"{entry['balance']:.2f} COIN"
+                self._bal_list.addItem(
+                    _make_rank_item(i, truncate(entry["address"], 10, 10), value_str)
+                )
+        else:
+            self._bal_list.addItem(QListWidgetItem("  No balances found"))
+
+    def _on_error(self, msg: str):
+        self._ts_lbl.setText("Update failed")
+        self._status_lbl.setText(f"✗  {msg}")
+        self._status_lbl.setStyleSheet(f"color:{C['error']}; font-size:11px;")
+        for lst in (self._miners_list, self._bal_list):
+            lst.clear()
+            lst.addItem(QListWidgetItem("  Failed to load — check node connection"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1441,7 +1873,9 @@ class AboutTab(QWidget):
             ("Curve",         "secp256k1"),
             ("Address derivation", "SHA-256 of raw public key bytes"),
             ("Hash function", "SHA-256 (block header + transactions)"),
-            ("Mining check",  f"Every {MINING_CHECK_INTERVAL:,} nonces"),
+            ("CPU check interval", f"Every {MINING_CHECK_INTERVAL:,} nonces"),
+            ("GPU batch size", f"{GPU_BATCH_SIZE:,} nonces/dispatch"),
+            ("GPU",           _GPU_NAME if GPU_AVAILABLE else "Not detected (install pyopencl)"),
             ("Wallet file",   WALLET_FILE),
         ]
         for k, v in rows:
@@ -1538,15 +1972,17 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
 
-        self._wallet_tab  = WalletTab(self.wallet)
-        self._mining_tab  = MiningTab(self.wallet)
-        self._explorer_tab = ExplorerTab()
-        self._about_tab   = AboutTab()
+        self._wallet_tab      = WalletTab(self.wallet)
+        self._mining_tab      = MiningTab(self.wallet)
+        self._explorer_tab    = ExplorerTab()
+        self._leaderboard_tab = LeaderboardTab()
+        self._about_tab       = AboutTab()
 
-        self.tabs.addTab(self._wallet_tab,   "  Wallet  ")
-        self.tabs.addTab(self._mining_tab,   "  Mining  ")
-        self.tabs.addTab(self._explorer_tab, "  Explorer")
-        self.tabs.addTab(self._about_tab,    "  Settings")
+        self.tabs.addTab(self._wallet_tab,      "  Wallet  ")
+        self.tabs.addTab(self._mining_tab,      "  Mining  ")
+        self.tabs.addTab(self._explorer_tab,    "  Explorer")
+        self.tabs.addTab(self._leaderboard_tab, "  Leaderboard")
+        self.tabs.addTab(self._about_tab,       "  Settings")
 
         content = QWidget()
         content.setStyleSheet(f"background:{C['bg']};")
@@ -1555,28 +1991,49 @@ class MainWindow(QMainWindow):
         c_lay.addWidget(self.tabs)
         outer.addWidget(content, 1)
 
-        # ── Network health check ──────────────────────────────────────
+        # ── Network health check (non-blocking, slow idle poll) ─────────
+        # Checks every 60 s while idle.  Individual actions (send, refresh)
+        # call _check_server() directly for an immediate on-demand ping.
         self._health_timer = QTimer(self)
         self._health_timer.timeout.connect(self._check_server)
-        self._health_timer.start(10_000)
-        self._check_server()
+        self._health_timer.start(60_000)
+        self._check_server()   # initial ping on startup
+
+        # Tab changes → refresh data-heavy tabs only when opened
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # Auto-fill mining tab if wallet already loaded
         self._mining_tab.wallet_updated()
 
+    def _on_tab_changed(self, idx: int):
+        tab = self.tabs.widget(idx)
+        if tab is self._explorer_tab:
+            self._explorer_tab.refresh()
+        elif tab is self._leaderboard_tab:
+            self._leaderboard_tab.refresh()
+        # Always do a quick connectivity ping when user switches tabs
+        self._check_server()
+
     def _check_server(self):
-        try:
-            r = requests.get(f"{SERVER_URL}/utxos", timeout=2)
-            if r.status_code == 200:
-                self._net_dot.set_active(True)
-                self._net_label.setText("Node online")
-                self._net_label.setStyleSheet(f"color:{C['success']}; font-size:11px;")
-                return
-        except Exception:
-            pass
-        self._net_dot.set_active(False)
-        self._net_label.setText("Node offline")
-        self._net_label.setStyleSheet(f"color:{C['error']}; font-size:11px;")
+        """Spin up a background ping so the main thread is never blocked."""
+        worker = HealthCheckWorker()
+        worker.result_signal.connect(self._on_health_result)
+        # Keep a reference so the thread isn't garbage-collected mid-run
+        if not hasattr(self, "_health_workers"):
+            self._health_workers = []
+        self._health_workers = [w for w in self._health_workers if w.isRunning()]
+        self._health_workers.append(worker)
+        worker.start()
+
+    def _on_health_result(self, online: bool):
+        if online:
+            self._net_dot.set_active(True)
+            self._net_label.setText("Node online")
+            self._net_label.setStyleSheet(f"color:{C['success']}; font-size:11px;")
+        else:
+            self._net_dot.set_active(False)
+            self._net_label.setText("Node offline")
+            self._net_label.setStyleSheet(f"color:{C['error']}; font-size:11px;")
 
     def closeEvent(self, event):
         self._mining_tab._stop_mining()
