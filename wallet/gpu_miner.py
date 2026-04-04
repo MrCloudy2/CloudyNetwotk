@@ -25,6 +25,12 @@ except ImportError:
 #  OpenCL kernel — SHA-256 mined directly on GPU
 # ─────────────────────────────────────────────────────────────────────────────
 KERNEL_SOURCE = r"""
+/* MSG_BUF_SIZE is injected at compile-time via -DMSG_BUF_SIZE=N
+   so every job gets a buffer that exactly fits its JSON block. */
+#ifndef MSG_BUF_SIZE
+#  define MSG_BUF_SIZE 256   /* fallback — should never be used */
+#endif
+
 #define ROTR(x,n) (rotate((uint)(x), (uint)(32-(n))))
 #define CH(x,y,z)  (((x)&(y))^(~(x)&(z)))
 #define MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))
@@ -70,8 +76,8 @@ __kernel void mine(
 
     int total = pre_len + nonce_len + post_len;
 
-    /* Assemble message */
-    uchar msg[256];
+    /* Assemble message — buffer sized per-job via -DMSG_BUF_SIZE */
+    uchar msg[MSG_BUF_SIZE];
     for (int i = 0; i < pre_len;   i++) msg[i]                       = pre_nonce[i];
     for (int i = 0; i < nonce_len; i++) msg[pre_len + i]             = nonce_str[i];
     for (int i = 0; i < post_len;  i++) msg[pre_len + nonce_len + i] = post_nonce[i];
@@ -157,6 +163,24 @@ def _eta_str(target: int, total_hashes: int, hashrate: float) -> str:
     return f"{eta_s:.0f}s"
 
 
+def _compute_msg_buf_size(pre_bytes: bytes, post_bytes: bytes) -> int:
+    """
+    Return the minimum OpenCL kernel buffer size (rounded up to the next
+    64-byte SHA-256 block boundary) needed to hash one block header.
+
+    Layout inside the kernel:
+        pre_bytes  |  nonce_digits (max 20)  |  post_bytes  |  SHA-256 padding
+
+    SHA-256 padding worst case adds up to 64 bytes (1-byte marker + zeros +
+    8-byte length), so we add one full extra 64-byte block as headroom.
+    """
+    max_nonce_digits = 20          # len(str(2**63)) == 19, +1 for safety
+    raw_max = len(pre_bytes) + max_nonce_digits + len(post_bytes)
+    # Round up to the next multiple of 64 then add one full block for padding
+    padded = ((raw_max + 64) // 64 + 1) * 64
+    return padded
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  GpuMiner — main class
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,6 +219,9 @@ class GpuMiner:
 
         self._stop_flag    = threading.Event()
         self._blocks_found = 0
+        # Cache compiled programs keyed by MSG_BUF_SIZE so we only recompile
+        # when the block JSON grows into a new size bucket.
+        self._prog_cache: dict[int, object] = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -211,7 +238,7 @@ class GpuMiner:
             return
 
         try:
-            ctx, queue, prog, device = self._setup_gpu()
+            ctx, queue, device = self._setup_gpu()
         except RuntimeError as e:
             self.on_log(f"✗ GPU init failed: {e}")
             return
@@ -271,7 +298,11 @@ class GpuMiner:
                 f"▶ GPU Job #{index}  target={hex(target)[:18]}…  txs={len(job_txs)}"
             )
 
-            # ── 3. Upload static buffers ─────────────────────────────────────
+            # ── 3. Compile (or reuse cached) kernel for this block's size ────
+            buf_size = _compute_msg_buf_size(pre_bytes, post_bytes)
+            prog     = self._get_program(ctx, buf_size)
+
+            # ── 4. Upload static buffers ─────────────────────────────────────
             pre_buf  = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
                                  hostbuf=np.frombuffer(pre_bytes,  dtype=np.uint8))
             post_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
@@ -289,7 +320,7 @@ class GpuMiner:
             solved       = False
             last_hr      = 0.0
 
-            # ── 4. GPU batch loop ────────────────────────────────────────────
+            # ── 5. GPU batch loop ────────────────────────────────────────────
             while not self._stop_flag.is_set():
                 # Reset per-batch output buffers
                 cl.enqueue_fill_buffer(queue, found_buf,        np.int32(0),  0, 4)
@@ -395,6 +426,20 @@ class GpuMiner:
                 })
                 self._stop_flag.wait(1)   # brief pause before next job
 
+    def _get_program(self, ctx, buf_size: int):
+        """
+        Return a compiled OpenCL program for the given MSG_BUF_SIZE.
+        Programs are cached so repeated jobs of the same size never
+        trigger an expensive recompile.
+        """
+        if buf_size not in self._prog_cache:
+            self.on_log(f"   Compiling kernel for MSG_BUF_SIZE={buf_size} …")
+            prog = cl.Program(ctx, KERNEL_SOURCE).build(
+                options=f"-DMSG_BUF_SIZE={buf_size}"
+            )
+            self._prog_cache[buf_size] = prog
+        return self._prog_cache[buf_size]
+
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _setup_gpu(self):
@@ -403,8 +448,7 @@ class GpuMiner:
                 if d.type == cl.device_type.GPU:
                     ctx   = cl.Context([d])
                     queue = cl.CommandQueue(ctx)
-                    prog  = cl.Program(ctx, KERNEL_SOURCE).build()
-                    return ctx, queue, prog, d
+                    return ctx, queue, d
         raise RuntimeError(
             "No OpenCL GPU found — install GPU drivers and pyopencl."
         )
