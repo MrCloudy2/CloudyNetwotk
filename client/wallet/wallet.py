@@ -37,16 +37,44 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QButtonGroup, QRadioButton
 
 # GPU mining support (optional — wallet works fine without pyopencl/pycuda)
+# Each step is wrapped individually so a crash in detect_gpu() (e.g. from a
+# partially-installed CUDA driver on Windows) never kills the whole app.
+GpuMiner      = None
+GPU_AVAILABLE = False
+_GPU_NAME     = None
+
 try:
     from gpu_miner import GpuMiner, detect_gpu
-    _GPU_NAME     = detect_gpu()   # None if no GPU or no backend installed
-    GPU_AVAILABLE = _GPU_NAME is not None
-except Exception:
-    # Catch all exceptions — pycuda/pyopencl can raise non-ImportError on
-    # Windows when drivers are present but not fully initialised at import time.
-    GpuMiner      = None
-    GPU_AVAILABLE = False
-    _GPU_NAME     = None
+except Exception as _e:
+    # Import itself failed (missing module, DLL load error, etc.)
+    try:
+        import datetime, os, sys
+        _log = os.path.join(os.path.dirname(os.path.abspath(
+                   sys.executable if getattr(sys, "frozen", False) else __file__
+               )), "gpu_crash.log")
+        with open(_log, "a") as _f:
+            _f.write(f"[{datetime.datetime.now()}] gpu_miner import failed: {_e}\n")
+    except Exception:
+        pass
+
+if GpuMiner is not None:
+    try:
+        _GPU_NAME     = detect_gpu()
+        GPU_AVAILABLE = _GPU_NAME is not None
+    except Exception as _e:
+        # detect_gpu() crashed (can happen on Windows with bad CUDA driver state)
+        try:
+            import datetime, os, sys
+            _log = os.path.join(os.path.dirname(os.path.abspath(
+                       sys.executable if getattr(sys, "frozen", False) else __file__
+                   )), "gpu_crash.log")
+            with open(_log, "a") as _f:
+                _f.write(f"[{datetime.datetime.now()}] detect_gpu() crashed: {_e}\n")
+        except Exception:
+            pass
+        GpuMiner      = None
+        GPU_AVAILABLE = False
+        _GPU_NAME     = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONSTANTS
@@ -56,14 +84,30 @@ BLOCK_REWARD = 1
 MINING_CHECK_INTERVAL = 500_000   # kept for About tab display only; CPU miner now uses time-based 10 s poll
 
 # Speed presets ───────────────────────────────────────────────────────────────
-# CPU: sleep injected per nonce in the inner Python loop
-CPU_SLEEP_NORMAL = 0.0001    # 100 µs/nonce  → frees ≈50 % CPU headroom
-CPU_SLEEP_HIGH   = 0.0       # no sleep      → max hashrate
+# Two modes: Normal (full speed) and Slow (~1/4 of normal).
+#
+# CPU: sleep injected per nonce in the inner Python loop.
+#   Normal = no sleep      → max hashrate
+#   Slow   = 40 µs/nonce  → ~25 % of max  (sleep ≈ 3× a typical loop iteration)
+CPU_SLEEP_NORMAL = 0.0       # no sleep      → max hashrate
+CPU_SLEEP_SLOW   = 0.00004   # 40 µs/nonce  → ~25 % throughput
 
-# GPU: sleep between 1 M-nonce batches  (uses stop-flag wait, so it's responsive)
-GPU_SLEEP_NORMAL = 0.08      # 80 ms rest between batches → GPU ~< 50 % load
-GPU_SLEEP_HIGH   = 0.0       # no rest       → max hashrate
-GPU_BATCH_SIZE   = 1_000_000 # nonces per GPU dispatch
+# GPU: batch size + inter-batch sleep together control throughput.
+#   At high hashrates (e.g. 900 MH/s) a 1M-nonce batch completes in ~1 ms.
+#   Batch size alone can't throttle enough because even 250k finishes in
+#   ~0.3 ms — so we combine a smaller batch with a fixed inter-batch sleep.
+#
+#   Slow target: ~25 % of Normal
+#     250k batch @ 900 MH/s ≈ 0.28 ms GPU time
+#     + 1 ms sleep  →  duty cycle ≈ 0.28 / 1.28 ≈ 22 %  (close to 25%)
+#     + 1 ms sleep  @ 200 MH/s batch≈1.25ms → 1.25/2.25 ≈ 55% (slower GPUs less affected)
+#   The 1 ms sleep is short enough to stay responsive and long enough to
+#   meaningfully reduce throughput on fast GPUs.
+GPU_SLEEP_NORMAL    = 0.0      # no rest between batches → max hashrate
+GPU_SLEEP_SLOW      = 0.001    # 1 ms rest after each batch (combined with smaller batch)
+# Normal mode passes batch_size=0 to GpuMiner so it auto-calibrates the
+# optimal batch size for the installed GPU (may be 2M or 4M on fast cards).
+GPU_BATCH_SIZE_SLOW =   250_000  # fixed batch for Slow mode (~25 % of typical optimum)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  COLOUR PALETTE  (dark industrial / terminal aesthetic)
@@ -281,7 +325,7 @@ QProgressBar {{
     border-radius: 4px;
     height: 6px;
     text-align: center;
-    font-size: 0px;
+    font-size: 1px;
 }}
 QProgressBar::chunk {{
     background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
@@ -471,6 +515,32 @@ def format_difficulty(target) -> str:
         return f"{attempts/1_000:.2f}k"
 
     return f"{attempts:.2f}"
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds > 86400: return ">1 day"
+    if seconds > 3600:  return f"{seconds/3600:.1f}h"
+    if seconds > 60:    return f"{seconds/60:.1f}m"
+    return f"{seconds:.0f}s"
+
+def _expected_block_time(target: int, hashrate: float) -> str:
+    """Expected average time per block at this hashrate (static, difficulty-based)."""
+    if hashrate <= 0 or target <= 0:
+        return "∞"
+    import math
+    difficulty = (2 ** 256) / (target + 1)
+    return _fmt_duration(difficulty / hashrate)
+
+def _luck_percent(target: int, total_hashes: int) -> str:
+    """
+    How much of the statistically expected work has been done, as %.
+    100% = you've done the average expected number of hashes.
+    At 100% the cumulative probability of having found it is ~63.2%.
+    """
+    if target <= 0 or total_hashes <= 0:
+        return "0%"
+    difficulty = (2 ** 256) / (target + 1)
+    luck = (total_hashes / difficulty) * 100.0
+    return f"{luck:.1f}%"
 
 _BINARY_HEADERS = {"Content-Type": "application/octet-stream"}
 
@@ -729,6 +799,9 @@ class MiningWorker(QThread):
                         "nonce":        nonce,
                         "block":        block_index,
                         "blocks_found": self._blocks_found,
+                        "elapsed":      elapsed,
+                        "expected":     _expected_block_time(target, hr),
+                        "luck":         _luck_percent(target, nonce),
                     })
                     time.sleep(0.5)
                     break
@@ -746,6 +819,9 @@ class MiningWorker(QThread):
                         "nonce":        nonce,
                         "block":        block_index,
                         "blocks_found": self._blocks_found,
+                        "elapsed":      elapsed,
+                        "expected":     _expected_block_time(target, hr),
+                        "luck":         _luck_percent(target, nonce),
                     })
 
                 # ── External-solve check every 10 s (/blockchain) ────────────
@@ -817,13 +893,15 @@ class GpuMiningWorker(QThread):
     to Qt signals so the UI can consume them safely.
     """
     log_signal   = Signal(str)
-    stats_signal = Signal(dict)      # {"hashrate", "nonce", "block", "blocks_found", "eta"}
-    found_signal = Signal(int, str)  # (block_index, block_hash)
+    stats_signal = Signal(dict)
+    found_signal = Signal(int, str)
 
-    def __init__(self, address: str, inter_batch_sleep: float = 0.0):
+    def __init__(self, address: str, inter_batch_sleep: float = 0.0,
+                 batch_size: int = 0):
         super().__init__()
         self._address           = address
         self._inter_batch_sleep = inter_batch_sleep
+        self._batch_size        = batch_size   # 0 = auto-calibrate
         self._miner             = None
 
     def stop(self):
@@ -837,14 +915,11 @@ class GpuMiningWorker(QThread):
                 "place it next to wallet.py and check pycuda/pyopencl install"
             )
             return
-        # GPU_AVAILABLE being False means detect_gpu() found nothing at import
-        # time, but GpuMiner itself will try both backends and report clearly.
-        # We let it run and fail gracefully rather than blocking here.
 
         self._miner = GpuMiner(
             address           = self._address,
             server_url        = SERVER_URL,
-            batch_size        = 0,   # 0 = auto-calibrate batch size
+            batch_size        = self._batch_size,
             inter_batch_sleep = self._inter_batch_sleep,
             on_log            = self.log_signal.emit,
             on_stats          = self.stats_signal.emit,
@@ -1133,11 +1208,17 @@ class StatCard(QFrame):
 #  WALLET TAB
 # ─────────────────────────────────────────────────────────────────────────────
 class WalletTab(QWidget):
-    def __init__(self, wallet: WalletState, parent=None):
+    def __init__(self, wallet: WalletState, on_wallet_changed=None, parent=None):
         super().__init__(parent)
         self.wallet = wallet
         self._balance = 0.0
         self._utxos   = []
+        # UTXOs we've already submitted in a pending (unconfirmed) transaction.
+        # Keyed as "tx_id:out_idx" strings — same format as the server's UTXO keys.
+        # Cleared automatically when the server stops reporting those UTXOs
+        # (i.e. the block was mined and they are now spent/confirmed).
+        self._pending_inputs: set[str] = set()
+        self._on_wallet_changed = on_wallet_changed
         self._build()
 
     def _build(self):
@@ -1296,7 +1377,10 @@ class WalletTab(QWidget):
         )
         if reply == QMessageBox.Yes:
             self.wallet.generate()
+            self._pending_inputs.clear()
             self._refresh_display()
+            if self._on_wallet_changed:
+                self._on_wallet_changed()
 
     def _import_wallet(self):
         dlg = QDialog(self)
@@ -1315,7 +1399,10 @@ class WalletTab(QWidget):
         if dlg.exec() == QDialog.Accepted:
             try:
                 self.wallet.load_from_private(inp.text().strip())
+                self._pending_inputs.clear()
                 self._refresh_display()
+                if self._on_wallet_changed:
+                    self._on_wallet_changed()
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
 
@@ -1342,16 +1429,34 @@ class WalletTab(QWidget):
         self._worker.start()
 
     def _on_balance(self, total: float, utxos: list):
+        # ── Prune confirmed pending inputs ───────────────────────────
+        # If a UTXO we marked as pending is no longer in the server's UTXO set,
+        # the transaction was confirmed and mined — remove it from the pending set.
+        current_keys = {u["key"] for u in utxos}
+        self._pending_inputs -= (self._pending_inputs - current_keys)
+
+        # ── Store and display all UTXOs ──────────────────────────────
         self._balance = total
-        # Sort descending by amount — matches the coin-selection order
         self._utxos = sorted(utxos, key=lambda u: u["amount"], reverse=True)
         self._bal_lbl.setText(f"{total:.2f}")
         self._utxo_list.clear()
         for u in self._utxos:
-            item = QListWidgetItem(f"  {truncate(u['key'], 12, 6)}   amount={u['amount']}")
+            pending = u["key"] in self._pending_inputs
+            tag  = "  [PENDING]" if pending else ""
+            item = QListWidgetItem(
+                f"  {truncate(u['key'], 12, 6)}   amount={u['amount']}{tag}"
+            )
+            if pending:
+                item.setForeground(QColor(C["text3"]))
             self._utxo_list.addItem(item)
         if not utxos:
             self._utxo_list.addItem(QListWidgetItem("  (no UTXOs found)"))
+
+        n_pending = len(self._pending_inputs & current_keys)
+        if n_pending:
+            self._utxo_list.addItem(
+                QListWidgetItem(f"  ({n_pending} UTXO(s) locked — awaiting confirmation)")
+            )
         # Refresh the preview if amount is already filled in
         self._preview_coin_selection()
 
@@ -1365,22 +1470,41 @@ class WalletTab(QWidget):
     def _select_utxos(self, amount: float):
         """
         Greedy largest-first coin selection.
+        Skips UTXOs already used in a pending (unconfirmed) transaction to
+        prevent double-spend rejections from the server.
         Returns (selected_utxos, total_in, change) or raises ValueError.
         """
         if not self._utxos:
             raise ValueError("No UTXOs available — refresh balance first.")
+
+        available = [u for u in self._utxos if u["key"] not in self._pending_inputs]
+        if not available:
+            raise ValueError(
+                "All UTXOs are locked in pending transactions.\n"
+                "Wait for the current transaction to be confirmed."
+            )
+
         selected = []
         total_in = 0.0
         # UTXOs already sorted descending by amount in _on_balance
-        for u in self._utxos:
+        for u in available:
+            if len(selected) >= 500:
+                break
             selected.append(u)
             total_in += u["amount"]
             if total_in >= amount:
                 break
+
         if total_in < amount:
-            raise ValueError(
-                f"Insufficient funds: have {total_in}, need {amount}"
+            locked_total = sum(
+                u["amount"] for u in self._utxos if u["key"] in self._pending_inputs
             )
+            hint = (
+                f"\n({locked_total} locked in pending tx — will unlock after confirmation)"
+                if locked_total else ""
+            )
+            raise ValueError(f"Insufficient funds: have {total_in}, need {amount}{hint}")
+
         change = total_in - amount
         return selected, total_in, change
 
@@ -1481,6 +1605,11 @@ class WalletTab(QWidget):
                 tx_id   = wire.decode_add_transaction_response(resp.content)
                 success = True
                 msg     = f"Transaction broadcast (tx_id={tx_id[:12]}…)"
+                # Lock the spent UTXOs so a second tx doesn't reuse them
+                # before this one is confirmed.  They will be auto-unlocked
+                # in _on_balance() once the server stops reporting them.
+                for u in selected:
+                    self._pending_inputs.add(u["key"])
             else:
                 success = False
                 msg     = wire.decode_error(resp.content) if resp.content else f"HTTP {resp.status_code}"
@@ -1510,8 +1639,9 @@ class WalletTab(QWidget):
 class MiningTab(QWidget):
     def __init__(self, wallet: WalletState, parent=None):
         super().__init__(parent)
-        self.wallet  = wallet
-        self._worker = None
+        self.wallet    = wallet
+        self._worker   = None
+        self._prog_pass = 1   # tracks current pass for progress bar colour
         self._build()
 
     def _build(self):
@@ -1567,17 +1697,18 @@ class MiningTab(QWidget):
 
         self._mode_group = QButtonGroup(self)
         self._rb_cpu = QRadioButton("CPU")
-        self._rb_cpu.setChecked(True)
+        self._rb_cpu.setChecked(not GPU_AVAILABLE)   # CPU default only if no GPU
 
-        # GPU radio — disabled if no GPU detected
+        # GPU radio — disabled if no GPU detected, selected by default if available
         gpu_label = "GPU"
         if GPU_AVAILABLE and _GPU_NAME:
             short_name = _GPU_NAME[:30] + ("…" if len(_GPU_NAME) > 30 else "")
             gpu_label  = f"GPU  ({short_name})"
         self._rb_gpu = QRadioButton(gpu_label)
         self._rb_gpu.setEnabled(GPU_AVAILABLE)
+        self._rb_gpu.setChecked(GPU_AVAILABLE)       # GPU default when available
         if not GPU_AVAILABLE:
-            tip = "No OpenCL GPU detected" if GpuMiner is not None else "gpu_miner.py not found"
+            tip = "No GPU detected" if GpuMiner is not None else "gpu_miner.py not found"
             self._rb_gpu.setToolTip(tip)
 
         self._mode_group.addButton(self._rb_cpu, 0)
@@ -1596,44 +1727,68 @@ class MiningTab(QWidget):
         self._rb_normal = QRadioButton("Normal")
         self._rb_normal.setChecked(True)
         self._rb_normal.setToolTip(
-            "CPU: 100 µs sleep/nonce — keeps PC responsive\n"
-            "GPU: 80 ms rest between batches — GPU stays cool"
+            "CPU: full speed — max hashrate\n"
+            "GPU: full 1M-nonce batches — max hashrate"
         )
-        self._rb_high = QRadioButton("High Speed")
-        self._rb_high.setToolTip(
-            "CPU: no sleep — max hashrate, high CPU usage\n"
-            "GPU: continuous batches — max hashrate"
+        self._rb_slow = QRadioButton("Slow")
+        self._rb_slow.setToolTip(
+            "CPU: 40 µs sleep/nonce — ~25 % of max hashrate\n"
+            "GPU: 250k-nonce batches + 1 ms sleep — ~25 % of max hashrate"
         )
         self._speed_group.addButton(self._rb_normal, 0)
-        self._speed_group.addButton(self._rb_high,   1)
+        self._speed_group.addButton(self._rb_slow,   1)
         options_row.addWidget(self._rb_normal)
-        options_row.addWidget(self._rb_high)
+        options_row.addWidget(self._rb_slow)
 
         options_row.addStretch()
         cfg_lay.addLayout(options_row)
         root.addWidget(cfg)
 
-        # ── Stat cards ───────────────────────────────────────────────
+        # ── Stat cards — single row ───────────────────────────────────
         stats_row = QHBoxLayout()
         stats_row.setSpacing(12)
 
-        self._hr_card     = StatCard("HASHRATE",      "—",  C["accent"])
-        self._nonce_card  = StatCard("NONCES TRIED",  "0",  C["accent2"])
-        self._block_card  = StatCard("CURRENT BLOCK", "—",  C["text"])
-        self._found_card  = StatCard("BLOCKS FOUND",  "0",  C["accent4"])
-        self._eta_card    = StatCard("ETA",            "—",  C["text2"])
+        self._hr_card       = StatCard("HASHRATE",        "—",   C["accent"])
+        self._nonce_card    = StatCard("NONCES TRIED",    "0",   C["accent2"])
+        self._elapsed_card  = StatCard("TIME ON BLOCK",   "0s",  C["text2"])
+        self._expected_card = StatCard("EXPECTED TIME",   "—",   C["text2"])
+        self._luck_card     = StatCard("WORK DONE",       "0%",  C["accent2"])
 
-        for c in (self._hr_card, self._nonce_card, self._block_card,
-                  self._found_card, self._eta_card):
+        self._elapsed_card.setToolTip("How long you have been mining the current block (stopwatch).")
+        self._expected_card.setToolTip(
+            "Average time to mine one block at your current hashrate.\n"
+            "Fixed statistical estimate — does not count down."
+        )
+        self._luck_card.setToolTip(
+            "How much of the statistically expected work has been done.\n"
+            "100% = you've done the average number of hashes needed.\n"
+            "At 100% there is still a 36.8% chance it hasn't come yet — this is normal."
+        )
+
+        for c in (self._hr_card, self._nonce_card,
+                  self._elapsed_card, self._expected_card, self._luck_card):
             stats_row.addWidget(c)
         root.addLayout(stats_row)
 
-        # ── Progress bar (indeterminate) ─────────────────────────────
+        # ── Progress bar ─────────────────────────────────────────────
+        prog_frame = QFrame()
+        prog_frame.setObjectName("card")
+        prog_lay = QVBoxLayout(prog_frame)
+        prog_lay.setContentsMargins(14, 8, 14, 8)
+        prog_lay.setSpacing(0)
+
         self._prog = QProgressBar()
-        self._prog.setRange(0, 0)        # indeterminate
-        self._prog.setVisible(False)
-        self._prog.setFixedHeight(6)
-        root.addWidget(self._prog)
+        self._prog.setRange(0, 1000)
+        self._prog.setValue(0)
+        self._prog.setFixedHeight(10)
+        self._prog.setTextVisible(False)
+        self._prog_pass  = 1
+        self._prog_color = C["accent"]
+        prog_lay.addWidget(self._prog)
+
+        self._prog_frame = prog_frame
+        self._prog_frame.setVisible(False)
+        root.addWidget(self._prog_frame)
 
         # ── Log ──────────────────────────────────────────────────────
         log_group = QGroupBox("Mining Log")
@@ -1657,8 +1812,12 @@ class MiningTab(QWidget):
         root.addWidget(log_group, 1)
 
     def wallet_updated(self):
-        if self.wallet.loaded and not self._addr_input.text():
-            self._addr_input.setText(self.wallet.address)
+        if self.wallet.loaded:
+            # Always update — covers generate, import, and first load.
+            # Don't overwrite mid-mining (worker running with a different address
+            # is intentional; the user can stop and restart to pick it up).
+            if not (self._worker and self._worker.isRunning()):
+                self._addr_input.setText(self.wallet.address)
 
     # ── Toggle mining ────────────────────────────────────────────────
     def _toggle_mining(self):
@@ -1673,17 +1832,19 @@ class MiningTab(QWidget):
             QMessageBox.warning(self, "No Address", "Enter a reward address first.")
             return
 
-        high_speed = self._speed_group.checkedId() == 1   # 1 = High Speed
+        high_speed = self._speed_group.checkedId() == 1   # 1 = Slow
         use_gpu    = self._mode_group.checkedId()  == 1   # 1 = GPU
 
         if use_gpu:
-            sleep = GPU_SLEEP_HIGH if high_speed else GPU_SLEEP_NORMAL
-            self._worker = GpuMiningWorker(addr, inter_batch_sleep=sleep)
-            mode_tag = f"GPU  {'[HIGH SPEED]' if high_speed else '[NORMAL]'}"
+            sleep      = GPU_SLEEP_SLOW if high_speed else GPU_SLEEP_NORMAL
+            batch_size = GPU_BATCH_SIZE_SLOW if high_speed else 0  # 0 = auto-calibrate
+            self._worker = GpuMiningWorker(addr, inter_batch_sleep=sleep,
+                                           batch_size=batch_size)
+            mode_tag = f"GPU  {'[SLOW]' if high_speed else '[NORMAL]'}"
         else:
-            sleep = CPU_SLEEP_HIGH if high_speed else CPU_SLEEP_NORMAL
+            sleep = CPU_SLEEP_SLOW if high_speed else CPU_SLEEP_NORMAL
             self._worker = MiningWorker(addr, throttle_sleep=sleep)
-            mode_tag = f"CPU  {'[HIGH SPEED]' if high_speed else '[NORMAL — throttled]'}"
+            mode_tag = f"CPU  {'[SLOW]' if high_speed else '[NORMAL]'}"
 
         self._worker.log_signal.connect(self._append_log)
         self._worker.stats_signal.connect(self._update_stats)
@@ -1698,10 +1859,12 @@ class MiningTab(QWidget):
         self._dot.set_active(True)
         self._state_lbl.setText("Mining…")
         self._state_lbl.setStyleSheet(f"color:{C['accent']}; font-size:11px;")
-        self._prog.setVisible(True)
+        self._prog.setValue(0)
+        self._prog_pass = 1
+        self._prog_frame.setVisible(True)
 
         # Lock mode/speed while running
-        for w in (self._rb_cpu, self._rb_gpu, self._rb_normal, self._rb_high):
+        for w in (self._rb_cpu, self._rb_gpu, self._rb_normal, self._rb_slow):
             w.setEnabled(False)
 
     def _stop_mining(self):
@@ -1713,12 +1876,12 @@ class MiningTab(QWidget):
         self._dot.set_active(False)
         self._state_lbl.setText("Idle")
         self._state_lbl.setStyleSheet(f"color:{C['text3']}; font-size:11px;")
-        self._prog.setVisible(False)
+        self._prog_frame.setVisible(False)
 
         # Restore mode/speed controls (GPU only if actually available)
         self._rb_cpu.setEnabled(True)
         self._rb_normal.setEnabled(True)
-        self._rb_high.setEnabled(True)
+        self._rb_slow.setEnabled(True)
         self._rb_gpu.setEnabled(GPU_AVAILABLE)
 
     # ── Worker callbacks ─────────────────────────────────────────────
@@ -1746,13 +1909,67 @@ class MiningTab(QWidget):
 
         self._hr_card.update_value(hr_str)
         self._nonce_card.update_value(f"{stats.get('nonce', 0):,}")
-        self._block_card.update_value(str(stats.get("block", "—")))
-        self._found_card.update_value(str(stats.get("blocks_found", 0)))
-        self._eta_card.update_value(stats.get("eta", "—"))
+
+        # ── Time row ─────────────────────────────────────────────────
+        elapsed_s = stats.get("elapsed", 0)
+        self._elapsed_card.update_value(_fmt_duration(elapsed_s))
+        self._expected_card.update_value(stats.get("expected", "—"))
+
+        luck_str = stats.get("luck", "0%")
+        self._luck_card.update_value(luck_str)
+
+        try:
+            luck_val = float(luck_str.rstrip("%"))
+        except (ValueError, AttributeError):
+            luck_val = 0.0
+
+        # ── Multi-pass progress bar ───────────────────────────────────
+        # Pass 1 = 0–100%   → green  (accent)
+        # Pass 2 = 100–200% → yellow (warning)
+        # Pass 3+ = 200%+   → red    (error)
+        #
+        # luck_val is the raw cumulative %, e.g. 147.3 means 1 full pass
+        # done + 47.3% into the second pass.
+        # We figure out which pass we're on and what % through it we are.
+
+        pass_num  = int(luck_val // 100) + 1   # 1-based pass number
+        pass_pct  = luck_val % 100             # 0–100 within the current pass
+        bar_value = int(pass_pct * 10)         # bar range is 0–1000
+
+        # Determine colour for current pass
+        if pass_num == 1:
+            color = C["accent"]    # green
+        elif pass_num == 2:
+            color = C["warning"]   # yellow
+        else:
+            color = C["error"]     # red
+
+        # Re-style the bar chunk colour only when the pass changes
+        if pass_num != self._prog_pass:
+            self._prog_pass  = pass_num
+            self._prog_color = color
+            self._prog.setStyleSheet(
+                f"QProgressBar::chunk {{"
+                f"  background: {color};"
+                f"  border-radius: 4px;"
+                f"}}"
+            )
+
+        self._prog.setValue(bar_value)
+
+        # Mirror colour on the luck card value label
+        self._luck_card._val_lbl.setStyleSheet(
+            f"color:{color}; font-size:22px; font-weight:700;"
+            f" font-family: 'JetBrains Mono', monospace;"
+        )
 
     def _on_found(self, index: int, bh: str):
         ca = C["accent4"]
         self._append_log(f"<span style='color:{ca}'>★ Block {index} confirmed!</span>")
+        # Reset progress bar for the next block
+        self._prog_pass = 1
+        self._prog.setValue(0)
+        self._prog.setStyleSheet("")   # revert to stylesheet default (green)
 
     def closeEvent(self, event):
         self._stop_mining()
@@ -2168,7 +2385,8 @@ class AboutTab(QWidget):
             ("Address derivation", "SHA-256 of raw public key bytes"),
             ("Hash function", "SHA-256 (block header + transactions)"),
             ("CPU check interval", "Every 10 s (time-based)"),
-            ("GPU batch size", f"{GPU_BATCH_SIZE:,} nonces/dispatch"),
+            ("GPU batch size (Normal)", "auto-calibrated"),
+            ("GPU batch size (Slow)",   f"{GPU_BATCH_SIZE_SLOW:,} nonces/dispatch"),
             ("GPU",           _GPU_NAME if GPU_AVAILABLE else "Not detected (install pyopencl)"),
             ("Wallet file",   WALLET_FILE),
         ]
@@ -2222,8 +2440,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Blockchain Wallet")
-        self.setMinimumSize(960, 700)
-        self.resize(1100, 780)
+        self.setMinimumSize(960, 760)
+        self.resize(1100, 860)
 
         self.wallet = WalletState()
         self._build()
@@ -2266,7 +2484,8 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
 
-        self._wallet_tab      = WalletTab(self.wallet)
+        self._wallet_tab      = WalletTab(self.wallet,
+                                          on_wallet_changed=self._on_wallet_changed_cb)
         self._mining_tab      = MiningTab(self.wallet)
         self._explorer_tab    = ExplorerTab()
         self._leaderboard_tab = LeaderboardTab()
@@ -2298,6 +2517,10 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # Auto-fill mining tab if wallet already loaded
+        self._mining_tab.wallet_updated()
+
+    def _on_wallet_changed_cb(self):
+        """Called whenever the wallet is generated or imported — propagate to all tabs."""
         self._mining_tab.wallet_updated()
 
     def _on_tab_changed(self, idx: int):
@@ -2335,9 +2558,6 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Chain Wallet")
     app.setOrganizationName("BlockchainDev")
-
-    # High-DPI support
-    app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     window = MainWindow()
     window.show()

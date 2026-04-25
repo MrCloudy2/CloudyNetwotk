@@ -74,31 +74,218 @@ except Exception:
 # =============================================================================
 
 import ctypes, ctypes.util
+import faulthandler
+import os
+import sys
+import platform
+import traceback
+import glob
 
-def _nvrtc_compile(source: str, sm_ver: str) -> bytes:
+# =============================================================================
+#  Crash logging
+#
+#  gpu_crash.log is written next to the executable (or CWD if that fails).
+#  faulthandler dumps a C-level stack trace there on hard crashes (segfault,
+#  access violation) that would otherwise silently kill the process.
+#  _cuda_log() writes breadcrumb messages so we always know the last step
+#  that ran before a crash, even if no Python exception was ever raised.
+# =============================================================================
+
+def _crash_log_path() -> str:
+    """Return a writable path for the crash log file."""
+    # Prefer the directory that holds the executable / main script
+    try:
+        base = os.path.dirname(os.path.abspath(sys.executable
+                               if getattr(sys, "frozen", False) else __file__))
+    except Exception:
+        base = os.getcwd()
+    return os.path.join(base, "gpu_crash.log")
+
+
+_CRASH_LOG = _crash_log_path()
+
+
+def _cuda_log(msg: str) -> None:
+    """Append a timestamped breadcrumb to the crash log (never raises)."""
+    try:
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_CRASH_LOG, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _enable_faulthandler() -> None:
+    """
+    Point faulthandler at the crash log so C-level crashes (segfault /
+    Windows access violation during DLL load or kernel compile) leave a
+    readable stack trace instead of silently killing the process.
+    """
+    try:
+        fh = open(_CRASH_LOG, "a", encoding="utf-8", errors="replace")
+        faulthandler.enable(file=fh)
+        _cuda_log(f"--- faulthandler enabled (python {sys.version}, "
+                  f"platform {platform.platform()}) ---")
+    except Exception:
+        pass   # faulthandler is best-effort; never block startup
+
+
+# Activate as early as possible
+_enable_faulthandler()
+
+
+# =============================================================================
+#  NVRTC DLL search
+#
+#  Windows ships many version-specific names for libnvrtc:
+#    nvrtc64_120_0.dll   CUDA 12.0
+#    nvrtc64_121_0.dll   CUDA 12.1
+#    nvrtc64_122_0.dll   CUDA 12.2  … and so on
+#    nvrtc64_12.dll      some CUDA 12.x driver-only installs
+#    nvrtc64_110_0.dll   CUDA 11.x
+#    nvrtc64_112_0.dll   CUDA 11.2
+#  Linux uses versioned .so symlinks: libnvrtc.so.12, libnvrtc.so.11, etc.
+#
+#  Strategy:
+#   1. Try every name in the hardcoded list.
+#   2. Glob the CUDA toolkit paths on Windows for any nvrtc64_*.dll.
+#   3. Fall back to ctypes.util.find_library("nvrtc").
+# =============================================================================
+
+_NVRTC_NAMES_LINUX = [
+    "libnvrtc.so",
+    "libnvrtc.so.12",
+    "libnvrtc.so.11",
+    "libnvrtc.so.10",
+]
+
+_NVRTC_NAMES_WINDOWS = [
+    # CUDA 12.x — driver-only or toolkit installs
+    "nvrtc64_12.dll",
+    # Specific CUDA 12 point releases (120 … 129 covers current + near-future)
+    *[f"nvrtc64_12{minor}_0.dll" for minor in range(10)],
+    # CUDA 11.x
+    "nvrtc64_11.dll",
+    *[f"nvrtc64_11{minor}_0.dll" for minor in range(10)],
+    # CUDA 10.x (old but still encountered)
+    "nvrtc64_10.dll",
+    *[f"nvrtc64_10{minor}_0.dll" for minor in range(5)],
+]
+
+def _find_nvrtc_lib():
+    """
+    Locate the NVRTC shared library without loading it yet.
+    Returns a ctypes.CDLL on success, raises RuntimeError with a
+    diagnostic message on failure.
+    """
+    is_win = sys.platform == "win32"
+    names  = _NVRTC_NAMES_WINDOWS if is_win else _NVRTC_NAMES_LINUX
+
+    _cuda_log(f"Searching for NVRTC DLL/SO (platform={sys.platform})")
+
+    # ── 1. Try well-known names directly ─────────────────────────────────────
+    for name in names:
+        try:
+            _cuda_log(f"  trying ctypes.CDLL({name!r})")
+            lib = ctypes.CDLL(name)
+            _cuda_log(f"  found: {name}")
+            return lib
+        except OSError:
+            pass
+
+    # ── 2. Glob Windows CUDA toolkit install dirs ─────────────────────────────
+    if is_win:
+        search_dirs = []
+        # Standard CUDA toolkit location
+        cuda_root = os.environ.get("CUDA_PATH", r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+        if os.path.isdir(cuda_root):
+            search_dirs.append(cuda_root)
+        # Also check all versioned subdirs, e.g. C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\bin
+        for pattern in [
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\nvrtc64_*.dll",
+            r"C:\Program Files (x86)\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\nvrtc64_*.dll",
+        ]:
+            for found_path in sorted(glob.glob(pattern), reverse=True):  # newest first
+                try:
+                    _cuda_log(f"  trying glob path: {found_path!r}")
+                    lib = ctypes.CDLL(found_path)
+                    _cuda_log(f"  found via glob: {found_path}")
+                    return lib
+                except OSError:
+                    pass
+
+    # ── 3. ctypes.util.find_library fallback ─────────────────────────────────
+    found = ctypes.util.find_library("nvrtc")
+    if found:
+        try:
+            _cuda_log(f"  trying find_library result: {found!r}")
+            lib = ctypes.CDLL(found)
+            _cuda_log(f"  found via find_library: {found}")
+            return lib
+        except OSError as e:
+            _cuda_log(f"  find_library load failed: {e}")
+
+    msg = (
+        "libnvrtc not found. Tried:\n"
+        + "\n".join(f"  {n}" for n in names)
+        + "\nInstall the NVIDIA CUDA toolkit or ensure the CUDA driver "
+          "package is present.\nSee gpu_crash.log for details."
+    )
+    _cuda_log(f"NVRTC not found: {msg}")
+    raise RuntimeError(msg)
+
+
+def _nvrtc_compile(source: str, sm_ver: str, use_fast_math: bool = True) -> bytes:
     """
     Compile CUDA C source to PTX using NVRTC (no nvcc required).
     sm_ver example: "sm_86" for Ampere RTX 3060.
+
+    use_fast_math : bool
+        Pass --use_fast_math to NVRTC.  A small number of driver versions on
+        Windows crash inside NVRTC when this flag is set; set to False to
+        compile in safe mode (~5 % slower but stable).
+
     Returns PTX bytes on success, raises RuntimeError on failure.
     """
-    # Locate libnvrtc — name varies by platform and CUDA version
-    lib_names = ["libnvrtc.so", "libnvrtc.so.12", "libnvrtc.so.11",
-                 "nvrtc64_120_0.dll", "nvrtc64_110_0.dll"]
-    lib = None
-    for name in lib_names:
-        try:
-            lib = ctypes.CDLL(name)
-            break
-        except OSError:
-            pass
-    if lib is None:
-        found = ctypes.util.find_library("nvrtc")
-        if found:
-            lib = ctypes.CDLL(found)
-    if lib is None:
-        raise RuntimeError("libnvrtc not found — install NVIDIA driver or CUDA toolkit")
+    _cuda_log(f"_nvrtc_compile called: sm={sm_ver} fast_math={use_fast_math}")
+
+    lib = _find_nvrtc_lib()
+
+    # Set argtypes to avoid crashes from mismatched calling conventions on
+    # 64-bit Windows (a common silent crash cause with ctypes + C variadic fns)
+    try:
+        lib.nvrtcCreateProgram.restype  = ctypes.c_int
+        lib.nvrtcCreateProgram.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        lib.nvrtcCompileProgram.restype  = ctypes.c_int
+        lib.nvrtcCompileProgram.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)
+        ]
+        lib.nvrtcGetProgramLogSize.restype  = ctypes.c_int
+        lib.nvrtcGetProgramLogSize.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)
+        ]
+        lib.nvrtcGetProgramLog.restype  = ctypes.c_int
+        lib.nvrtcGetProgramLog.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.nvrtcGetPTXSize.restype  = ctypes.c_int
+        lib.nvrtcGetPTXSize.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)
+        ]
+        lib.nvrtcGetPTX.restype  = ctypes.c_int
+        lib.nvrtcGetPTX.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.nvrtcDestroyProgram.restype  = ctypes.c_int
+        lib.nvrtcDestroyProgram.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    except Exception as e:
+        _cuda_log(f"argtypes setup failed (non-fatal): {e}")
 
     # nvrtcCreateProgram
+    _cuda_log("nvrtcCreateProgram …")
     prog_p = ctypes.c_void_p(0)
     src_b  = source.encode()
     ret = lib.nvrtcCreateProgram(
@@ -108,24 +295,31 @@ def _nvrtc_compile(source: str, sm_ver: str) -> bytes:
     )
     if ret != 0:
         raise RuntimeError(f"nvrtcCreateProgram failed: {ret}")
+    _cuda_log("nvrtcCreateProgram OK")
 
     prog = prog_p
 
     # nvrtcCompileProgram
     arch_opt = f"--gpu-architecture={sm_ver}".encode()
-    opts = (ctypes.c_char_p * 2)(
-        b"--use_fast_math",
-        arch_opt,
-    )
-    ret = lib.nvrtcCompileProgram(prog, ctypes.c_int(2), opts)
+    if use_fast_math:
+        opts     = (ctypes.c_char_p * 2)(b"--use_fast_math", arch_opt)
+        n_opts   = ctypes.c_int(2)
+    else:
+        opts     = (ctypes.c_char_p * 1)(arch_opt)
+        n_opts   = ctypes.c_int(1)
+
+    _cuda_log(f"nvrtcCompileProgram (fast_math={use_fast_math}) …")
+    ret = lib.nvrtcCompileProgram(prog, n_opts, opts)
     if ret != 0:
-        # Retrieve log
         log_size = ctypes.c_size_t(0)
         lib.nvrtcGetProgramLogSize(prog, ctypes.byref(log_size))
         log_buf = ctypes.create_string_buffer(log_size.value)
         lib.nvrtcGetProgramLog(prog, log_buf)
         lib.nvrtcDestroyProgram(ctypes.byref(prog))
-        raise RuntimeError(f"NVRTC compile error:\n{log_buf.value.decode(errors='replace')}")
+        err_text = log_buf.value.decode(errors="replace")
+        _cuda_log(f"nvrtcCompileProgram FAILED:\n{err_text}")
+        raise RuntimeError(f"NVRTC compile error:\n{err_text}")
+    _cuda_log("nvrtcCompileProgram OK")
 
     # Get PTX
     ptx_size = ctypes.c_size_t(0)
@@ -133,6 +327,7 @@ def _nvrtc_compile(source: str, sm_ver: str) -> bytes:
     ptx_buf = ctypes.create_string_buffer(ptx_size.value)
     lib.nvrtcGetPTX(prog, ptx_buf)
     lib.nvrtcDestroyProgram(ctypes.byref(prog))
+    _cuda_log(f"PTX generated ({ptx_size.value} bytes)")
     return ptx_buf.raw
 
 
@@ -256,14 +451,46 @@ def _target_to_uint32_be(target_int):
     return np.frombuffer(target_int.to_bytes(32,"big"), dtype=np.dtype(">u4")).astype(np.uint32)
 
 
-def _eta_str(target, total_hashes, hashrate):
-    if hashrate <= 0: return "∞"
-    remaining = max(0, (2**256)//(target+1) - total_hashes)
-    eta_s = remaining / hashrate
-    if eta_s > 86400: return ">1 day"
-    if eta_s > 3600:  return f"{eta_s/3600:.1f}h"
-    if eta_s > 60:    return f"{eta_s/60:.1f}m"
-    return f"{eta_s:.0f}s"
+def _fmt_duration(seconds: float) -> str:
+    """Format a duration in seconds to a human-readable string."""
+    if seconds > 86400: return ">1 day"
+    if seconds > 3600:  return f"{seconds/3600:.1f}h"
+    if seconds > 60:    return f"{seconds/60:.1f}m"
+    return f"{seconds:.0f}s"
+
+
+def _expected_block_time(target: int, hashrate: float) -> str:
+    """
+    Return the statistically expected average time to mine one block
+    at the current hashrate.  This is difficulty / hashrate — a fixed
+    number that does NOT depend on how many hashes have already been tried.
+    """
+    if hashrate <= 0 or target <= 0:
+        return "∞"
+    difficulty = (2 ** 256) / (target + 1)
+    return _fmt_duration(difficulty / hashrate)
+
+
+def _luck_percent(target: int, total_hashes: int) -> str:
+    """
+    Return how much of the statistically expected work has been done, as %.
+
+    Uses:  luck% = (hashes_done / expected_hashes) * 100
+    where  expected_hashes = difficulty = 2^256 / (target+1)
+
+    Interpretation:
+      < 100%  — you've done less than the average expected work (lucky so far)
+        100%  — you've hit the average (still 36.8% chance it hasn't come yet)
+      > 100%  — running over average (unlucky — but still totally normal)
+
+    At exactly 100% the cumulative solve probability is ~63.2% (1-1/e),
+    which is why the block is not guaranteed even at 100%.
+    """
+    if target <= 0 or total_hashes <= 0:
+        return "0%"
+    difficulty = (2 ** 256) / (target + 1)
+    luck = (total_hashes / difficulty) * 100.0
+    return f"{luck:.1f}%"
 
 
 # =============================================================================
@@ -715,6 +942,7 @@ class _CudaBackend:
         self._d_fnd  = None
 
     def setup(self):
+        _cuda_log("_CudaBackend.setup: opening CUDA device 0 …")
         dev       = cuda.Device(0)
         self._dev = dev
         # make_context() auto-pushes; pop immediately so we start with a
@@ -725,38 +953,64 @@ class _CudaBackend:
         sm_count  = dev.get_attribute(cuda.device_attribute.MULTIPROCESSOR_COUNT)
         cc        = dev.compute_capability()
         self.device_name = f"{dev.name()}  (SM {cc[0]}.{cc[1]}, {sm_count} SMs)"
+        _cuda_log(f"_CudaBackend.setup OK: {self.device_name}")
 
     def compile(self):
         self._ctx.push()
         try:
             cc = self._dev.compute_capability()
             sm = f"sm_{cc[0]}{cc[1]}"
+            _cuda_log(f"_CudaBackend.compile: device={self.device_name} sm={sm}")
             compiled = False
+            _nvrtc_err = None
 
-            # ── Path 1: NVRTC via ctypes (no nvcc required) ───────────────────
-            _nvrtc_err = None   # captured outside except so it survives the block
+            # ── Path 1a: NVRTC with --use_fast_math ───────────────────────────
+            # This is the fastest path but crashes on a small number of Windows
+            # driver versions.  We try it first, then fall back gracefully.
             try:
-                ptx = _nvrtc_compile(CUDA_KERNEL, sm)
+                _cuda_log("Path 1a: NVRTC + fast_math …")
+                ptx = _nvrtc_compile(CUDA_KERNEL, sm, use_fast_math=True)
+                _cuda_log("Path 1a: PTX ready, loading module …")
                 self._mod = cuda.module_from_buffer(ptx)
                 self._fn  = self._mod.get_function("mine")
                 compiled  = True
+                _cuda_log("Path 1a: SUCCESS")
             except Exception as _e:
-                _nvrtc_err = _e   # Python 3.11+ deletes 'as' vars after except exits
+                _nvrtc_err = _e
+                _cuda_log(f"Path 1a failed: {_e}")
+
+            # ── Path 1b: NVRTC without --use_fast_math (safer fallback) ───────
+            if not compiled:
+                try:
+                    _cuda_log("Path 1b: NVRTC without fast_math …")
+                    ptx = _nvrtc_compile(CUDA_KERNEL, sm, use_fast_math=False)
+                    _cuda_log("Path 1b: PTX ready, loading module …")
+                    self._mod = cuda.module_from_buffer(ptx)
+                    self._fn  = self._mod.get_function("mine")
+                    compiled  = True
+                    _cuda_log("Path 1b: SUCCESS (safe mode, slightly slower)")
+                except Exception as _e1b:
+                    _cuda_log(f"Path 1b failed: {_e1b}")
+                    _nvrtc_err = _e1b   # keep the most recent error
 
             # ── Path 2: pycuda.compiler (requires nvcc in PATH) ───────────────
             if not compiled:
                 try:
+                    _cuda_log("Path 2: pycuda.compiler (nvcc) …")
                     import pycuda.compiler as _nvcc
                     self._mod = _nvcc.SourceModule(CUDA_KERNEL, no_extern_c=True,
                                                    options=["--use_fast_math"])
                     self._fn  = self._mod.get_function("mine")
                     compiled  = True
+                    _cuda_log("Path 2: SUCCESS")
                 except Exception as _nvcc_err:
+                    _cuda_log(f"Path 2 failed: {_nvcc_err}")
                     raise RuntimeError(
-                        f"CUDA compile failed.\n"
+                        f"CUDA compile failed on all paths.\n"
                         f"  NVRTC: {str(_nvrtc_err).encode('ascii', 'replace').decode()}\n"
                         f"  nvcc:  {str(_nvcc_err).encode('ascii', 'replace').decode()}\n"
-                        f"Install nvidia-cuda-toolkit or ensure libnvrtc.so is present."
+                        f"See gpu_crash.log for details.\n"
+                        f"Install nvidia-cuda-toolkit or ensure libnvrtc.so / nvrtc64_*.dll is present."
                     )
         finally:
             self._ctx.pop()
@@ -1101,6 +1355,7 @@ class GpuMiner:
         if CUDA_AVAILABLE:
             b = _CudaBackend()
             try:
+                _cuda_log("_init_backends: starting CUDA path")
                 b.setup()
                 self.on_log(f"   CUDA device : {b.device_name}")
                 self.on_log("   Compiling CUDA kernel…")
@@ -1109,11 +1364,15 @@ class GpuMiner:
                 bs, batch, hr = b.calibrate(self.on_log)
                 b._alloc_persistent()
                 results.append((b, bs, batch, hr))
+                _cuda_log("_init_backends: CUDA path complete")
             except Exception as e:
                 # Log the ASCII-safe version so Windows doesn't choke on
                 # any special characters in driver error messages
                 safe_err = str(e).encode("ascii", "replace").decode()
+                tb_str   = traceback.format_exc()
+                _cuda_log(f"_init_backends CUDA FAILED:\n{tb_str}")
                 self.on_log(f"   CUDA failed: {safe_err}")
+                self.on_log(f"   (details written to {_CRASH_LOG})")
                 try:
                     b.cleanup()
                 except Exception:
@@ -1226,6 +1485,7 @@ class GpuMiner:
             start_nonce  = np.uint64(0)
             start_t      = time.time()
             poll_t       = start_t
+            refresh_t    = start_t
             total_hashes = 0
             solved       = False
             hr_window    = []
@@ -1251,7 +1511,9 @@ class GpuMiner:
                     "nonce":        total_hashes,
                     "block":        block_index,
                     "blocks_found": self._blocks_found,
-                    "eta":          _eta_str(target, total_hashes, last_hr),
+                    "elapsed":      time.time() - start_t,
+                    "expected":     _expected_block_time(target, last_hr),
+                    "luck":         _luck_percent(target, total_hashes),
                 })
 
                 if found:
@@ -1270,7 +1532,24 @@ class GpuMiner:
                                 break
                     except Exception:
                         pass
-
+                # ── Job refresh every 2 min — ujame difficulty spremembo ──────
+                if now - refresh_t > 120:
+                    refresh_t = now
+                    try:
+                        r = _api_get(
+                            f"{self.server_url}/get_mining_job",
+                            params={"miner_address": self.address},
+                            timeout=5,
+                        )
+                        if r.status_code == 200:
+                            new_job = wire.decode_mining_job(r.content)
+                            if new_job["target"] != target:
+                                self.on_log(
+                                    f"⟳ Target spremenjen → nov job #{new_job['block_index']}"
+                                )
+                                break
+                    except Exception:
+                        pass
                 if self.inter_batch_sleep > 0:
                     self._stop_flag.wait(self.inter_batch_sleep)
 
@@ -1312,7 +1591,10 @@ class GpuMiner:
                 self.on_found(block_index, block_hash)
                 self.on_stats({
                     "hashrate": last_hr, "nonce": total_hashes,
-                    "block": block_index, "blocks_found": self._blocks_found, "eta": "—",
+                    "block": block_index, "blocks_found": self._blocks_found,
+                    "elapsed": time.time() - start_t,
+                    "expected": _expected_block_time(target, last_hr),
+                    "luck": _luck_percent(target, total_hashes),
                 })
                 self._stop_flag.wait(1)
 
