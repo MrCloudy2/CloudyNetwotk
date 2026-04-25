@@ -7,10 +7,9 @@ import ecdsa
 import os
 import threading
 import sqlite3
-from contextlib import contextmanager
 from block_header import (
     calculate_hash_binary, pack_header, unpack_header,
-    HEADER_VERSION, HEADER_SIZE,
+    HEADER_VERSION, HEADER_SIZE, _sha256d,
 )
 from merkle import merkle_root_hex, merkle_proof, verify_tx_inclusion, tx_leaf_hash
 from tx_codec import tx_to_bytes, bytes_to_tx, block_txs_to_bytes
@@ -29,11 +28,15 @@ limiter = Limiter(
 
 # --- CONFIGURABLE CONSTANTS ---
 BLOCK_REWARD = 1
-TARGET_BLOCK_TIME = 120
-SMOOTHNESS = 5
+TARGET_BLOCK_TIME = 600
 MAX_TIMESTAMP_AGE = 7200
 GENESIS_TARGET = 0x0000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 DB_FILE = "blockchain.db"
+
+# Transaction & mempool limits
+MAX_TX_INPUTS   = 500   # max inputs per transaction
+MAX_TX_OUTPUTS  = 50   # max outputs per transaction
+MAX_MEMPOOL_SIZE = 1000  # max pending transactions held in memory
 
 
 def get_address_from_public_key(public_key_hex):
@@ -182,7 +185,6 @@ class Blockchain:
         self.mempool = []
         self.utxos = {}
         self.target_block_time = TARGET_BLOCK_TIME
-        self.smoothness = SMOOTHNESS
         self.current_target = GENESIS_TARGET
 
         init_db()
@@ -263,14 +265,18 @@ class Blockchain:
     # ------------------------------------------------------------------
 
     def _save_block(self, block):
-        """Persist a single block + UTXO changes to SQLite."""
+        """Persist a single block + UTXO changes to SQLite.
+
+        Raises RuntimeError if the write fails so the caller can roll back
+        any in-memory state changes made before calling this method.
+        """
         try:
             conn = get_db_connection()
             with conn:                       # auto-commit / rollback
                 _save_block_to_db(conn, block)
             conn.close()
         except Exception as e:
-            print(f"[ERROR] Failed to save block to DB: {e}")
+            raise RuntimeError(f"Failed to save block {block.get('index')} to DB: {e}") from e
 
     # ------------------------------------------------------------------
     # Core logic (unchanged from original)
@@ -285,31 +291,83 @@ class Blockchain:
         return calculate_hash_binary(block, block.get("transactions", []))
 
     def calculate_next_target(self):
+        """
+        Linearly Weighted Moving Average (LWMA) difficulty adjustment.
+
+        Uses a 5-block window where more recent blocks carry higher weight,
+        so the algorithm reacts quickly to hashrate changes without the
+        overshoot a simple average produces on a short chain.
+
+        Per-block clamp: target may change at most 3x in either direction,
+        allowing fast recovery from a spike without wild oscillation.
+        """
         if len(self.chain) < 2:
             return GENESIS_TARGET
-
-        blocks_to_count = min(len(self.chain) - 1, 10)
-        reference_block = self.chain[-1 - blocks_to_count]
-        latest_block = self.chain[-1]
-
-        actual_time = max(1, latest_block["timestamp"] - reference_block["timestamp"])
-        expected_time = self.target_block_time * blocks_to_count
 
         last_target = self.chain[-1].get("difficulty_target", GENESIS_TARGET)
         if not isinstance(last_target, int) or last_target <= 0:
             print(f"[WARN] Bad difficulty_target in chain tip ({last_target!r}), resetting.")
             last_target = GENESIS_TARGET
 
-        lo = (expected_time * 75) // 100
-        hi = (expected_time * 125) // 100
-        clamped_actual = max(lo, min(actual_time, hi))
+        # Window: up to 5 most recent inter-block intervals
+        N      = min(len(self.chain) - 1, 5)
+        window = self.chain[-(N + 1):]   # N+1 blocks -> N solve-time intervals
 
-        new_target = (last_target * clamped_actual) // expected_time
+        # LWMA: weight i in [1..N], most recent block gets weight N.
+        # Individual solve times clamped to 6x target so one very-slow block
+        # cannot dominate the average.
+        weighted_time = 0
+        weight_sum    = 0
+        for i in range(1, N + 1):
+            solve_time = max(1, window[i]["timestamp"] - window[i - 1]["timestamp"])
+            solve_time = min(solve_time, self.target_block_time * 6)
+            weighted_time += solve_time * i
+            weight_sum    += i
+
+        avg_solve_time = weighted_time / weight_sum
+
+        new_target = int(last_target * avg_solve_time / self.target_block_time)
+
+        # Clamp: no more than 3x easier or harder per adjustment
+        new_target = max(last_target // 3, min(new_target, last_target * 3))
+
         MIN_TARGET = GENESIS_TARGET >> 32
-        new_target = max(MIN_TARGET, min(new_target, GENESIS_TARGET))
-        return new_target
+        return max(MIN_TARGET, min(new_target, GENESIS_TARGET))
+
+    def get_job_target(self) -> int:
+        """
+        Effective target for a new mining job, with a real-time time-decay
+        boost applied on top of the chain difficulty.
+
+        If the last block arrived on time this equals calculate_next_target().
+        If the chain is overdue the target is relaxed proportionally, preventing
+        the deadlock where high difficulty and absent miners lock each other out.
+
+        The boost is ephemeral: it only affects the working target baked into
+        the job header. The accepted block is stored with whatever target it
+        actually solved against, correctly reflecting real network conditions.
+
+        Boost table (multiples of TARGET_BLOCK_TIME elapsed since last block):
+            <= 1x  -> 1.0x  (no change, on schedule)
+               2x  -> 2.0x  easier
+               4x  -> 4.0x  easier
+              16x  -> 16.0x easier  (hard cap)
+        """
+        base_target = self.calculate_next_target()
+        elapsed     = time.time() - self.chain[-1]["timestamp"]
+        boost       = max(1.0, min(elapsed / self.target_block_time, 16.0))
+        return min(int(base_target * boost), GENESIS_TARGET)
 
     def validate_transaction(self, tx, is_mempool_check=True):
+        if not tx["inputs"]:
+            raise ValueError("Transaction must have at least one input")
+        if not tx["outputs"]:
+            raise ValueError("Transaction must have at least one output")
+        if len(tx["inputs"]) > MAX_TX_INPUTS:
+            raise ValueError(f"Transaction exceeds maximum input count ({MAX_TX_INPUTS})")
+        if len(tx["outputs"]) > MAX_TX_OUTPUTS:
+            raise ValueError(f"Transaction exceeds maximum output count ({MAX_TX_OUTPUTS})")
+
         total_out = sum(out["amount"] for out in tx["outputs"])
         if total_out <= 0:
             raise ValueError("Invalid output amount")
@@ -328,7 +386,7 @@ class Blockchain:
                 raise ValueError(f"Duplicate input in transaction: {utxo_key}")
             seen_utxos.add(utxo_key)
             if utxo_key not in self.utxos:
-                raise ValueError(f"UTXO {utxo_key} not found or already spent")
+                raise ValueError("Input not found or already spent")
 
             utxo = self.utxos[utxo_key]
             if get_address_from_public_key(inp["public_key"]) != utxo["address"]:
@@ -340,8 +398,10 @@ class Blockchain:
                 )
                 if not vk.verify(bytes.fromhex(inp["signature"]), msg):
                     raise ValueError("Invalid signature")
-            except Exception:
-                raise ValueError("Signature verification failed")
+            except ValueError:
+                raise
+            except Exception as e:
+                raise ValueError(f"Signature verification failed: {e}") from e
 
             if is_mempool_check:
                 if any(
@@ -526,14 +586,18 @@ def get_blockchain():
         [4B uint32  mempool_blob_length]
         [NB         block_txs_to_bytes(mempool)]
     """
-    conn = get_db_connection()
-    chain, _ = _load_chain_from_db(conn)
-    conn.close()
+    # Hold the lock only long enough to take a consistent snapshot of the
+    # in-memory chain and mempool — avoids a torn read if a block is committed
+    # concurrently.  Encoding happens outside the lock.
+    with blockchain.lock:
+        chain_snapshot  = list(blockchain.chain)
+        mempool_snapshot = list(blockchain.mempool)
+
     out = io.BytesIO()
-    out.write(struct.pack(">I", len(chain)))
-    for block in chain:
+    out.write(struct.pack(">I", len(chain_snapshot)))
+    for block in chain_snapshot:
         out.write(_encode_block_wire(block))
-    mempool_blob = block_txs_to_bytes(blockchain.mempool)
+    mempool_blob = block_txs_to_bytes(mempool_snapshot)
     out.write(struct.pack(">I", len(mempool_blob)))
     out.write(mempool_blob)
     return _wire_ok(out.getvalue())
@@ -542,7 +606,9 @@ def get_blockchain():
 @app.route("/utxos", methods=["GET"])
 def get_utxos():
     """Binary wire format: _encode_utxos_wire(utxos)."""
-    return _wire_ok(_encode_utxos_wire(blockchain.utxos))
+    with blockchain.lock:
+        utxos_snapshot = dict(blockchain.utxos)
+    return _wire_ok(_encode_utxos_wire(utxos_snapshot))
 
 
 @app.route("/get_mining_job", methods=["GET"])
@@ -586,7 +652,7 @@ def get_mining_job():
     with blockchain.lock:
         block_index = len(blockchain.chain)
         prev_hash   = blockchain.chain[-1]["block_hash"]
-        target      = blockchain.calculate_next_target()
+        target      = blockchain.get_job_target()   # time-decay applied here
         timestamp   = int(time.time())
 
         # Build coinbase — paying this specific miner
@@ -708,7 +774,6 @@ def submit_block():
             return _wire_error("Merkle root mismatch — transactions do not match header", 400)
 
         # ── Step 6: Proof-of-Work check ───────────────────────────────────────
-        from block_header import _sha256d
         block_hash = _sha256d(header_bytes).hex()
 
         if int(block_hash, 16) > job["target"]:
@@ -735,6 +800,12 @@ def submit_block():
             "transactions":      block_txs,
             "block_hash":        block_hash,
         }
+
+        # Snapshot state so we can roll back if the DB write fails
+        prev_chain_len    = len(blockchain.chain)
+        prev_utxos        = dict(blockchain.utxos)
+        prev_mempool      = list(blockchain.mempool)
+
         blockchain.chain.append(accepted_block)
 
         mined_tx_ids    = {tx["tx_id"] for tx in miner_txs}
@@ -756,7 +827,15 @@ def submit_block():
             )
         ]
 
-        blockchain._save_block(accepted_block)
+        try:
+            blockchain._save_block(accepted_block)
+        except RuntimeError as e:
+            # DB write failed — roll back every in-memory change
+            blockchain.chain     = blockchain.chain[:prev_chain_len]
+            blockchain.utxos     = prev_utxos
+            blockchain.mempool   = prev_mempool
+            print(f"[CRITICAL] {e} — in-memory state rolled back.")
+            return _wire_error("Internal server error: block could not be persisted", 500)
 
     _delete_job(job_id)
 
@@ -796,27 +875,23 @@ def get_tx_proof(tx_id):
 
     Response 404 — binary error envelope (see _wire_error).
     """
-    # ── 1. Find the transaction in the database ───────────────────────────────
+    # ── 1. Find the transaction and fetch its block's data in one connection ───
     conn = get_db_connection()
     try:
         row = conn.execute(
             "SELECT tx_json, block_idx FROM transactions WHERE tx_id = ?",
             (tx_id,)
         ).fetchone()
-    finally:
-        conn.close()
 
-    if row is None:
-        return _wire_error(f"Transaction {tx_id!r} not found in any confirmed block", 404)
+        if row is None:
+            return _wire_error(f"Transaction {tx_id!r} not found in any confirmed block", 404)
 
-    tx        = json.loads(row["tx_json"])
-    block_idx = row["block_idx"]
+        tx        = json.loads(row["tx_json"])
+        block_idx = row["block_idx"]
 
-    # ── 2. Fetch the full ordered transaction list for that block ─────────────
-    # We need the list in insertion order (rowid) so the Merkle tree is
-    # reconstructed with the same leaf ordering used at mining time.
-    conn = get_db_connection()
-    try:
+        # ── 2. Fetch the full ordered transaction list for that block ─────────
+        # We need the list in insertion order (rowid) so the Merkle tree is
+        # reconstructed with the same leaf ordering used at mining time.
         tx_rows = conn.execute(
             "SELECT tx_json FROM transactions WHERE block_idx = ? ORDER BY rowid",
             (block_idx,)
@@ -877,11 +952,15 @@ def add_transaction():
 
     with blockchain.lock:
         try:
+            if len(blockchain.mempool) >= MAX_MEMPOOL_SIZE:
+                return _wire_error(
+                    f"Mempool full ({MAX_MEMPOOL_SIZE} transactions). Try again later.", 429
+                )
             blockchain.validate_transaction(tx, is_mempool_check=True)
-            msg = json.dumps(
-                {"inputs": tx["inputs"], "outputs": tx["outputs"]}, sort_keys=True
-            ).encode()
-            tx["tx_id"] = hashlib.sha256(msg).hexdigest()
+            # tx_id = SHA256 of the full binary encoding (includes signatures),
+            # so two transactions with identical inputs/outputs but different
+            # signatures cannot collide on tx_id.
+            tx["tx_id"] = hashlib.sha256(request.data).hexdigest()
             blockchain.mempool.append(tx)
             return _wire_ok(bytes.fromhex(tx["tx_id"]), 201)
         except Exception as e:
