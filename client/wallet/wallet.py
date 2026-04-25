@@ -1488,7 +1488,7 @@ class WalletTab(QWidget):
         total_in = 0.0
         # UTXOs already sorted descending by amount in _on_balance
         for u in available:
-            if len(selected) >= 500:
+            if len(selected) >= 255:
                 break
             selected.append(u)
             total_in += u["amount"]

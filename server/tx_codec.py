@@ -10,7 +10,7 @@ Wire format (all multi-byte integers are big-endian):
   │ [only when tx_type == 2 (coinbase)]                     │
   │   varint  block_index                                   │
   ├─────────────────────────────────────────────────────────┤
-  │ varint  n_inputs                                         │
+  │ 1B   n_inputs                                           │
   │  ╔══ repeated n_inputs times ═══════════════════════╗   │
   │  ║ 32B  tx_id       (binary, from hex)              ║   │
   │  ║  1B  out_idx                                     ║   │
@@ -18,7 +18,7 @@ Wire format (all multi-byte integers are big-endian):
   │  ║ 64B  signature   (raw R||S DER-less, from hex)   ║   │
   │  ╚═══════════════════════════════════════════════════╝   │
   ├─────────────────────────────────────────────────────────┤
-  │ varint  n_outputs                                        │
+  │ 1B   n_outputs                                          │
   │  ╔══ repeated n_outputs times ══════════════════════╗   │
   │  ║ 32B  address  (binary SHA-256 digest, from hex)  ║   │
   │  ║ varint  amount                                   ║   │
@@ -160,9 +160,9 @@ def tx_to_bytes(tx: dict) -> bytes:
 
     # ── Inputs ──────────────────────────────────────────────────────────────
     inputs = tx.get("inputs", [])
-    if len(inputs) > 500:
-        raise ValueError(f"Too many inputs: {len(inputs)} (max 500)")
-    out.write(_encode_varint(len(inputs)))
+    if len(inputs) > 255:
+        raise ValueError(f"Too many inputs: {len(inputs)} (max 255)")
+    out.write(struct.pack("B", len(inputs)))
 
     for inp in inputs:
         tx_id_val = inp["tx_id"]
@@ -204,9 +204,9 @@ def tx_to_bytes(tx: dict) -> bytes:
 
     # ── Outputs ─────────────────────────────────────────────────────────────
     outputs = tx.get("outputs", [])
-    if len(outputs) > 500:
-        raise ValueError(f"Too many outputs: {len(outputs)} (max 500)")
-    out.write(_encode_varint(len(outputs)))
+    if len(outputs) > 255:
+        raise ValueError(f"Too many outputs: {len(outputs)} (max 255)")
+    out.write(struct.pack("B", len(outputs)))
 
     for output in outputs:
         addr = output["address"]
@@ -275,7 +275,7 @@ def bytes_to_tx(byte_data: bytes) -> dict:
         coinbase_block_idx = _decode_varint(buf)
 
     # ── Inputs ──────────────────────────────────────────────────────────────
-    n_inputs = _decode_varint(buf)
+    n_inputs = struct.unpack("B", _read_exact(buf, 1))[0]
     inputs = []
     for _ in range(n_inputs):
         tx_id_flag = struct.unpack("B", _read_exact(buf, 1))[0]
@@ -297,7 +297,7 @@ def bytes_to_tx(byte_data: bytes) -> dict:
         })
 
     # ── Outputs ─────────────────────────────────────────────────────────────
-    n_outputs = _decode_varint(buf)
+    n_outputs = struct.unpack("B", _read_exact(buf, 1))[0]
     outputs = []
     for _ in range(n_outputs):
         addr_flag = struct.unpack("B", _read_exact(buf, 1))[0]
